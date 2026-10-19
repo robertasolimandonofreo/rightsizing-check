@@ -154,6 +154,10 @@ func scan(args []string, env Env) int {
 	if err != nil {
 		return fail("error: %v", err)
 	}
+	if len(inv.Workloads) == 0 {
+		// Not an error, but a typo in the path would otherwise pass a CI check silently.
+		fmt.Fprintf(env.Stderr, "warning: no workloads found in %s (Deployments, StatefulSets, DaemonSets, Jobs, CronJobs and Pods are read)\n", strings.Join(paths, ", "))
+	}
 	var data usage.Dataset
 	load := func(path string, parse func(io.Reader) ([]usage.Sample, error)) error {
 		if path == "" {

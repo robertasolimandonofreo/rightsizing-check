@@ -170,3 +170,11 @@ func TestExplainAndVersion(t *testing.T) {
 		t.Errorf("version output = %q", out)
 	}
 }
+
+func TestEmptyScanWarns(t *testing.T) {
+	dir := t.TempDir()
+	code, _, errOut := run(t, "", "scan", dir, "--csv", csv)
+	if code != exitOK || !strings.Contains(errOut, "no workloads found") {
+		t.Errorf("exit=%d stderr=%q", code, errOut)
+	}
+}
