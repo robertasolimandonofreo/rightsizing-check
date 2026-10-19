@@ -154,6 +154,20 @@ func scan(args []string, env Env) int {
 	if err != nil {
 		return fail("error: %v", err)
 	}
+	if n := len(inv.Unreadable); n > 0 {
+		shown := inv.Unreadable
+		if len(shown) > 3 {
+			shown = shown[:3]
+		}
+		fmt.Fprintf(env.Stderr, "warning: skipped %d files that are not valid Kubernetes YAML (Helm templates, for example); first: ", n)
+		for i, u := range shown {
+			if i > 0 {
+				fmt.Fprint(env.Stderr, ", ")
+			}
+			fmt.Fprint(env.Stderr, u.Path)
+		}
+		fmt.Fprintln(env.Stderr)
+	}
 	if len(inv.Workloads) == 0 {
 		// Not an error, but a typo in the path would otherwise pass a CI check silently.
 		fmt.Fprintf(env.Stderr, "warning: no workloads found in %s (Deployments, StatefulSets, DaemonSets, Jobs, CronJobs and Pods are read)\n", strings.Join(paths, ", "))

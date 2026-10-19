@@ -1,6 +1,8 @@
 package inventory
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -107,5 +109,46 @@ func TestPathsWalksDirectoriesAndStdin(t *testing.T) {
 		if inv.Workloads[i-1].ID() > inv.Workloads[i].ID() {
 			t.Error("workloads are not sorted by ID")
 		}
+	}
+}
+
+func TestDirectoryWalkSkipsFilesThatDoNotParse(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, doc string) {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(doc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("good.yaml", "apiVersion: v1\nkind: Pod\nmetadata: {name: good}\nspec: {containers: [{name: c, image: c:1}]}\n")
+	// A Helm template: valid YAML for the first document, then template syntax.
+	write("template.yaml", "apiVersion: v1\nkind: Pod\nmetadata: {name: half}\nspec: {containers: [{name: c, image: c:1}]}\n---\nmetadata:\n  name: {{ .Release.Name }}\n")
+
+	inv, err := Paths([]string{dir}, strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(inv.Workloads) != 1 || inv.Workloads[0].Name != "good" {
+		t.Errorf("workloads = %+v, want only the good pod (nothing from the skipped file)", inv.Workloads)
+	}
+	if len(inv.Unreadable) != 1 || !strings.HasSuffix(inv.Unreadable[0].Path, "template.yaml") {
+		t.Errorf("unreadable = %+v", inv.Unreadable)
+	}
+
+	// The same file named on the command line is an error.
+	if _, err := Paths([]string{filepath.Join(dir, "template.yaml")}, strings.NewReader("")); err == nil {
+		t.Error("an explicit file that does not parse must fail")
+	}
+}
+
+func TestGenerateNameStandsInForTheName(t *testing.T) {
+	inv := load(t, `
+apiVersion: batch/v1
+kind: Job
+metadata: {generateName: migrate-, namespace: nps}
+spec:
+  template: {spec: {containers: [{name: m, image: m:1}]}}
+`)
+	if len(inv.Workloads) != 1 || inv.Workloads[0].ID() != "nps/job/migrate-*" {
+		t.Errorf("workloads = %+v", inv.Workloads)
 	}
 }
