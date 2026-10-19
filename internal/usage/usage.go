@@ -67,9 +67,7 @@ func (d *Dataset) Merge(in []Sample) {
 		if s.MemBytes >= 0 {
 			cur.MemBytes = s.MemBytes
 		}
-		if s.Source == Snapshot {
-			cur.Source = Snapshot
-		}
+		cur.Source = s.Source
 	}
 }
 
