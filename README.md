@@ -9,7 +9,7 @@ keeps nodes half empty, and Karpenter cannot consolidate pods that say they need
 `rightsizing-check` lists the requests to lower, how much they free, and the workloads that are
 under-requested, which are a risk of their own.
 
-> **Status: early (v0.1).** It reads manifests and three kinds of usage file. It is not a
+> **Status: early (v0.1.0).** It reads manifests and three kinds of usage file. It is not a
 > recommender that applies changes: it never edits your files. See [Limits](#limits).
 
 ## Why another one
@@ -21,7 +21,24 @@ environment. You export the numbers once and the analysis is a pure function of 
 
 ## Install
 
-Build it with Go (a release with binaries and a container image comes with the first tag):
+Download a binary for Linux, macOS or Windows (amd64 and arm64) from the
+[releases page](https://github.com/robertasolimandonofreo/rightsizing-check/releases), and check it
+against `checksums.txt`:
+
+```bash
+tar -xzf rightsizing-check_<version>_linux_amd64.tar.gz
+sha256sum -c --ignore-missing checksums.txt
+sudo mv rightsizing-check /usr/local/bin/
+```
+
+Or use the container image (linux/amd64 and linux/arm64), mounting your manifests and usage files:
+
+```bash
+docker run --rm -v "$PWD:/work:ro" ghcr.io/robertasolimandonofreo/rightsizing-check:latest \
+  scan /work/k8s --csv /work/usage.csv
+```
+
+Or build it with Go:
 
 ```bash
 go install github.com/robertasolimandonofreo/rightsizing-check/cmd/rightsizing-check@latest
