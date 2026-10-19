@@ -170,7 +170,7 @@ func TestBytes(t *testing.T) {
 }
 
 func TestCatalogHasEveryRule(t *testing.T) {
-	for _, id := range []string{"RC001", "RC002", "RC003", "RC004", "RC005", "RC006", "RC007", "RC008", "RC009"} {
+	for _, id := range []string{"RC001", "RC002", "RC003", "RC004", "RC005", "RC006", "RC007", "RC008", "RC009", "RC010", "RC011"} {
 		if r, ok := Lookup(id); !ok || r.Title == "" || r.Why == "" || r.Fix == "" {
 			t.Errorf("%s is missing or incomplete", id)
 		}
@@ -314,5 +314,83 @@ func TestScalersFor(t *testing.T) {
 	twice = append(twice, twice[len(twice)-1])
 	if got := ScalersFor(w, twice); len(got) != 2 {
 		t.Errorf("a duplicate must be dropped, got %d", len(got))
+	}
+}
+
+func vpa(mode string, off ...string) inventory.VPA {
+	return inventory.VPA{Name: "api", Namespace: "shop", TargetKind: "Deployment", TargetName: "api", Mode: mode, OffContainers: off}
+}
+
+func TestVPAMakesAManualChangeMoot(t *testing.T) {
+	w := workload(t, "Deployment", "api", "            requests: {cpu: 1000m, memory: 2Gi}\n", 2)
+	eval := func(v ...inventory.VPA) Assessment {
+		a := Evaluate(w, map[string][]usage.Sample{"app": {sample("api-5d8f7c9b6-x2k4j", 120, 600*mib)}}, DefaultConfig(), nil)
+		AddVPAFindings(&a, v)
+		return a
+	}
+	if got := eval(vpa("Auto")); !strings.Contains(ids(got), "RC010") || !got.VPAControlled || got.ControlledBy[0] != "VerticalPodAutoscaler/api" {
+		t.Errorf("an Auto VPA must warn: %q controlled=%v by=%v", ids(got), got.VPAControlled, got.ControlledBy)
+	}
+	for _, mode := range []string{"Recreate", "Initial", "InPlaceOrRecreate"} {
+		if got := eval(vpa(mode)); !strings.Contains(ids(got), "RC010") {
+			t.Errorf("%s controls the requests: %q", mode, ids(got))
+		}
+	}
+	if got := eval(vpa("Off")); strings.Contains(ids(got), "RC010") || got.VPAControlled {
+		t.Errorf("an Off VPA only recommends: %q", ids(got))
+	}
+	if got := eval(vpa("Auto", "app")); strings.Contains(ids(got), "RC010") {
+		t.Errorf("the container is out of the VPA's control: %q", ids(got))
+	}
+	if got := eval(); strings.Contains(ids(got), "RC010") || len(got.ControlledBy) != 0 {
+		t.Error("no VPA, nothing to say")
+	}
+	// A workload whose requests this tool would not change has nothing for the VPA to overwrite.
+	close := workload(t, "Deployment", "api", "            requests: {cpu: 150m, memory: 700Mi}\n", 1)
+	a := Evaluate(close, map[string][]usage.Sample{"app": {sample("api-5d8f7c9b6-x2k4j", 120, 600*mib)}}, DefaultConfig(), nil)
+	AddVPAFindings(&a, []inventory.VPA{vpa("Auto")})
+	if strings.Contains(ids(a), "RC010") {
+		t.Errorf("no change recommended, so nothing is overwritten: %q", ids(a))
+	}
+}
+
+func TestVPARecommendationIsShownNextToOurs(t *testing.T) {
+	w := workload(t, "Deployment", "api", "            requests: {cpu: 1000m, memory: 2Gi}\n", 1)
+	a := Evaluate(w, map[string][]usage.Sample{"app": {sample("api-5d8f7c9b6-x2k4j", 120, 600*mib)}}, DefaultConfig(), nil)
+	v := vpa("Off")
+	v.Recommendations = []inventory.VPARecommendation{{Container: "app", CPUMillis: 300, MemBytes: 900 * mib}, {Container: "other", CPUMillis: 1}}
+	AddVPAFindings(&a, []inventory.VPA{v})
+	var msg string
+	for _, f := range a.Findings {
+		if f.Rule == "RC011" {
+			msg = f.Message
+		}
+	}
+	for _, want := range []string{"VerticalPodAutoscaler api recommends 300m CPU and 900Mi memory", "this tool recommends 140m CPU and 720Mi memory"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message lacks %q: %s", want, msg)
+		}
+	}
+	if strings.Count(ids(a), "RC011") != 1 {
+		t.Errorf("only the container that exists and has usage gets one: %q", ids(a))
+	}
+}
+
+func TestVPAsFor(t *testing.T) {
+	w := inventory.Workload{Kind: "Deployment", Namespace: "shop", Name: "api"}
+	all := []inventory.VPA{vpa("Auto"), vpa("Auto"), {Name: "x", Namespace: "other", TargetKind: "Deployment", TargetName: "api"}, {Name: "y", Namespace: "shop", TargetKind: "StatefulSet", TargetName: "api"}}
+	if got := VPAsFor(w, all); len(got) != 1 {
+		t.Errorf("vpas = %+v (the duplicate and the other targets must be dropped)", got)
+	}
+}
+
+func TestRolloutPodsAreNamedLikeDeploymentPods(t *testing.T) {
+	ws := []inventory.Workload{{Kind: "Rollout", Namespace: "shop", Name: "canary"}}
+	m := Match(ws, []usage.Sample{
+		{Namespace: "shop", Pod: "canary-5d8f7c9b6-x2k4j", Container: "app"},
+		{Namespace: "shop", Pod: "canary-extra-words-abc", Container: "app"},
+	})
+	if len(m.ByWorkload[0]["app"]) != 1 || m.Unmatched != 1 {
+		t.Errorf("matched %d, unmatched %d", len(m.ByWorkload[0]["app"]), m.Unmatched)
 	}
 }

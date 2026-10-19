@@ -218,3 +218,83 @@ spec: {}
 		t.Errorf("keda = %+v (AverageValue and rabbitmq triggers must be left out)", keda)
 	}
 }
+
+func TestVPAsAndRollouts(t *testing.T) {
+	inv := load(t, `
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata: {name: api, namespace: shop}
+spec:
+  targetRef: {apiVersion: apps/v1, kind: Deployment, name: api}
+  updatePolicy: {updateMode: "Off"}
+  resourcePolicy:
+    containerPolicies:
+      - {containerName: sidecar, mode: "Off"}
+      - {containerName: app, minAllowed: {cpu: 50m}}
+status:
+  recommendation:
+    containerRecommendations:
+      - containerName: app
+        target: {cpu: 140m, memory: 720Mi}
+        lowerBound: {cpu: 100m, memory: 600Mi}
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata: {name: web, namespace: shop}
+spec:
+  targetRef: {kind: StatefulSet, name: web}
+---
+apiVersion: other.example.com/v1
+kind: VerticalPodAutoscaler
+metadata: {name: not-a-vpa}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata: {name: canary, namespace: shop}
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers: [{name: app, image: a:1, resources: {requests: {cpu: 200m}}}]
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata: {name: by-ref, namespace: shop}
+spec:
+  workloadRef: {apiVersion: apps/v1, kind: Deployment, name: api}
+---
+apiVersion: other.example.com/v1
+kind: Rollout
+metadata: {name: not-argo}
+spec:
+  template: {spec: {containers: [{name: c, image: c:1}]}}
+`)
+	if len(inv.VPAs) != 2 {
+		t.Fatalf("vpas = %+v", inv.VPAs)
+	}
+	api, web := inv.VPAs[0], inv.VPAs[1]
+	if api.Mode != "Off" || api.TargetName != "api" || len(api.OffContainers) != 1 || api.OffContainers[0] != "sidecar" {
+		t.Errorf("api vpa = %+v", api)
+	}
+	if len(api.Recommendations) != 1 || api.Recommendations[0] != (VPARecommendation{Container: "app", CPUMillis: 140, MemBytes: 720 << 20}) {
+		t.Errorf("recommendation = %+v", api.Recommendations)
+	}
+	if web.Mode != "Auto" || web.TargetKind != "StatefulSet" {
+		t.Errorf("an unset updateMode is Auto: %+v", web)
+	}
+	if api.Controls("app") || api.Controls("sidecar") || !web.Controls("anything") {
+		t.Error("Off controls nothing; Auto controls every container")
+	}
+	pol := VPA{Mode: "Auto", OffContainers: []string{"sidecar"}}
+	if !pol.Controls("app") || pol.Controls("sidecar") {
+		t.Error("a resource policy in Off mode takes a container out")
+	}
+
+	if len(inv.Workloads) != 1 || inv.Workloads[0].Kind != "Rollout" || inv.Workloads[0].ID() != "shop/rollout/canary" ||
+		inv.Workloads[0].Replicas != 3 || !inv.Workloads[0].LongRunning || inv.Workloads[0].CPUMillis != 200 {
+		t.Errorf("workloads = %+v (only the Argo Rollout with a template counts)", inv.Workloads)
+	}
+	if inv.Skipped["Rollout (workloadRef)"] != 1 {
+		t.Errorf("skipped = %v", inv.Skipped)
+	}
+}
