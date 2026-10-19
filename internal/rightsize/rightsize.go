@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 
 	"github.com/robertasolimandonofreo/rightsizing-check/internal/inventory"
 	"github.com/robertasolimandonofreo/rightsizing-check/internal/usage"
@@ -74,6 +75,10 @@ type Assessment struct {
 	Findings   []Finding          `json:"findings"`
 	// AutoscaledBy names the HPAs and KEDA ScaledObjects that target the workload.
 	AutoscaledBy []string `json:"autoscaledBy,omitempty"`
+	// ControlledBy names the VPAs that set the requests of the workload.
+	ControlledBy []string `json:"controlledBy,omitempty"`
+	// VPAControlled is true when a VPA would overwrite a change that this tool recommends (RC010).
+	VPAControlled bool `json:"-"`
 	// ScalesOut is true when lowering the CPU request to the recommendation would push an HPA
 	// above its target (RC009 on CPU).
 	ScalesOut bool `json:"-"`
@@ -327,4 +332,85 @@ func scalerFindings(a *Assessment, scalers []inventory.Autoscaler, add adder) {
 			}
 		}
 	}
+}
+
+// VPAsFor returns the VerticalPodAutoscalers that target the workload, in its namespace.
+func VPAsFor(w inventory.Workload, all []inventory.VPA) []inventory.VPA {
+	var out []inventory.VPA
+	seen := map[string]bool{}
+	for _, v := range all {
+		if v.Namespace != w.Namespace || v.TargetName != w.Name || v.TargetKind != w.Kind {
+			continue
+		}
+		if !seen[v.Name] { // the same object can be scanned twice
+			seen[v.Name] = true
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// AddVPAFindings checks the workload against the VPAs that target it. A VPA that controls a
+// container whose request this tool would change makes the change moot (RC010); the VPA's own
+// target is shown next to the recommendation when the object carries one (RC011). Neither changes
+// the status of the workload.
+func AddVPAFindings(a *Assessment, vpas []inventory.VPA) {
+	if len(vpas) == 0 {
+		return
+	}
+	changes := map[string]bool{} // containers for which a request change is recommended
+	for _, f := range a.Findings {
+		switch f.Rule {
+		case "RC001", "RC002", "RC003", "RC004", "RC006":
+			changes[f.Container] = true
+		}
+	}
+	add := func(rule, container, format string, args ...any) {
+		r, _ := Lookup(rule)
+		a.Findings = append(a.Findings, Finding{Rule: rule, Kind: r.Kind, Container: container, Message: fmt.Sprintf(format, args...)})
+	}
+	for _, v := range vpas {
+		a.ControlledBy = append(a.ControlledBy, "VerticalPodAutoscaler/"+v.Name)
+		var overwritten []string
+		for _, c := range a.Containers {
+			if changes[c.Name] && v.Controls(c.Name) {
+				overwritten = append(overwritten, c.Name)
+			}
+		}
+		if len(overwritten) > 0 {
+			a.VPAControlled = true
+			add("RC010", "", "VerticalPodAutoscaler %s (mode %s) sets the requests of %s, so a request changed by hand will be overwritten", v.Name, v.Mode, quoted(overwritten))
+		}
+		for _, r := range v.Recommendations {
+			for _, c := range a.Containers {
+				if c.Name != r.Container || (!c.HasUsageCPU && !c.HasUsageMem) {
+					continue
+				}
+				add("RC011", c.Name, "container %q: VerticalPodAutoscaler %s recommends %s; this tool recommends %s", c.Name, v.Name, describe(r.CPUMillis, r.MemBytes), describe(c.CPURec, c.MemRec))
+			}
+		}
+	}
+	sortFindings(a.Findings)
+}
+
+func quoted(names []string) string {
+	q := make([]string, len(names))
+	for i, n := range names {
+		q[i] = fmt.Sprintf("%q", n)
+	}
+	return strings.Join(q, ", ")
+}
+
+func describe(cpu, mem int64) string {
+	var parts []string
+	if cpu > 0 {
+		parts = append(parts, fmt.Sprintf("%dm CPU", cpu))
+	}
+	if mem > 0 {
+		parts = append(parts, Bytes(mem)+" memory")
+	}
+	if len(parts) == 0 {
+		return "nothing"
+	}
+	return strings.Join(parts, " and ")
 }

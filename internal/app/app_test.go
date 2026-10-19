@@ -296,3 +296,60 @@ func TestPrometheusOptionErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestVPAAndRolloutEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	m := filepath.Join(dir, "m.yaml")
+	os.WriteFile(m, []byte(`
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata: {name: canary, namespace: shop}
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - {name: app, image: a:1, resources: {requests: {cpu: 500m, memory: 1Gi}}}
+---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata: {name: canary, namespace: shop}
+spec:
+  targetRef: {apiVersion: argoproj.io/v1alpha1, kind: Rollout, name: canary}
+  updatePolicy: {updateMode: InPlaceOrRecreate}
+`), 0o600)
+	u := filepath.Join(dir, "u.csv")
+	os.WriteFile(u, []byte("namespace,pod,container,cpu_millis,memory_bytes\nshop,canary-5d8f7c9b6-x2k4j,app,40,100000000\n"), 0o600)
+	_, out, _ := run(t, "", "scan", m, "--csv", u, "-f", "json")
+	var doc struct {
+		Summary struct {
+			Reclaim  int64 `json:"reclaimableCPUMillis"`
+			UnderVPA int64 `json:"reclaimableCPUMillisUnderVPA"`
+		} `json:"summary"`
+		Workloads []struct {
+			ID           string   `json:"id"`
+			ControlledBy []string `json:"controlledBy"`
+			Findings     []struct {
+				Rule string `json:"rule"`
+			} `json:"findings"`
+		} `json:"workloads"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil || len(doc.Workloads) != 1 {
+		t.Fatalf("%v: %s", err, out)
+	}
+	w := doc.Workloads[0]
+	var rules []string
+	for _, f := range w.Findings {
+		rules = append(rules, f.Rule)
+	}
+	if w.ID != "shop/rollout/canary" || !strings.Contains(strings.Join(rules, ","), "RC010") || len(w.ControlledBy) != 1 {
+		t.Errorf("id %q rules %v controlledBy %v", w.ID, rules, w.ControlledBy)
+	}
+	if doc.Summary.UnderVPA == 0 || doc.Summary.UnderVPA != doc.Summary.Reclaim {
+		t.Errorf("all the reclaimable CPU is under the VPA: %+v", doc.Summary)
+	}
+	_, table, _ := run(t, "", "scan", m, "--csv", u)
+	if !strings.Contains(table, "whose requests a VPA sets (RC010)") {
+		t.Errorf("the summary should explain it:\n%s", table)
+	}
+}

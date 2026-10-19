@@ -19,6 +19,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 )
@@ -65,6 +66,47 @@ type Inventory struct {
 	// Autoscalers are the HorizontalPodAutoscalers and KEDA ScaledObjects found next to the
 	// workloads. One that scales on utilization uses the request as its denominator.
 	Autoscalers []Autoscaler
+	// VPAs are the VerticalPodAutoscalers found next to the workloads. One that is not in Off mode
+	// sets the requests itself, so a request changed by hand does not last.
+	VPAs []VPA
+}
+
+// VPA is what the request rules need from a VerticalPodAutoscaler.
+type VPA struct {
+	Name       string
+	Namespace  string
+	TargetKind string
+	TargetName string
+	// Mode is the updateMode: Off, Initial, Recreate, Auto or InPlaceOrRecreate. An unset mode is
+	// Auto, which is the default of the VPA.
+	Mode string
+	// OffContainers are the containers that the resource policy takes out of the VPA's control.
+	OffContainers []string
+	// Recommendations is what the VPA itself recommends, when the object carries a status (a live
+	// cluster, or a manifest exported from one).
+	Recommendations []VPARecommendation
+	File            string
+}
+
+// VPARecommendation is the target of the VPA for one container. A missing value is zero.
+type VPARecommendation struct {
+	Container string
+	CPUMillis int64
+	MemBytes  int64
+}
+
+// Controls reports whether the VPA sets the requests of the container: it is not in Off mode, and
+// the resource policy does not take the container out.
+func (v VPA) Controls(container string) bool {
+	if v.Mode == "Off" {
+		return false
+	}
+	for _, c := range v.OffContainers {
+		if c == container {
+			return false
+		}
+	}
+	return true
 }
 
 // Autoscaler is what the request-based rules need from an HPA or a KEDA ScaledObject.
@@ -126,12 +168,12 @@ func Paths(paths []string, stdin io.Reader) (*Inventory, error) {
 			}
 			// A file named on the command line must parse. One found in a directory may be
 			// a template or a values file, so it is skipped, and nothing it held is kept.
-			before, scalers, skipped := len(inv.Workloads), len(inv.Autoscalers), maps.Clone(inv.Skipped)
+			before, scalers, vpas, skipped := len(inv.Workloads), len(inv.Autoscalers), len(inv.VPAs), maps.Clone(inv.Skipped)
 			if err := inv.Add(path, data); err != nil {
 				if path == p {
 					return fmt.Errorf("%s: %w", path, err)
 				}
-				inv.Workloads, inv.Autoscalers, inv.Skipped = inv.Workloads[:before], inv.Autoscalers[:scalers], skipped
+				inv.Workloads, inv.Autoscalers, inv.VPAs, inv.Skipped = inv.Workloads[:before], inv.Autoscalers[:scalers], inv.VPAs[:vpas], skipped
 				inv.Unreadable = append(inv.Unreadable, Unreadable{Path: path, Reason: firstLine(err)})
 			}
 			return nil
@@ -354,6 +396,89 @@ func (inv *Inventory) addObject(file string, raw json.RawMessage) error {
 			a.Metrics = append(a.Metrics, ScaleMetric{Resource: t.Type, Target: target, Container: container})
 		}
 		inv.Autoscalers = append(inv.Autoscalers, a)
+	case "Rollout":
+		// Argo Rollouts: a Deployment with a different strategy. Its pods are named like a
+		// Deployment's.
+		if !strings.HasPrefix(meta.APIVersion, "argoproj.io/") {
+			return nil
+		}
+		var o struct {
+			Metadata metav1.ObjectMeta `json:"metadata"`
+			Spec     struct {
+				Replicas    *int32                 `json:"replicas"`
+				Template    corev1.PodTemplateSpec `json:"template"`
+				WorkloadRef *struct {
+					Name string `json:"name"`
+				} `json:"workloadRef"`
+			} `json:"spec"`
+		}
+		if err := decode(&o); err != nil {
+			return err
+		}
+		if len(o.Spec.Template.Spec.Containers) == 0 {
+			// A Rollout that points at a Deployment (workloadRef) has no template of its own: the
+			// Deployment is the workload that gets analyzed.
+			inv.Skipped["Rollout (workloadRef)"]++
+			return nil
+		}
+		add("Rollout", o.Metadata, o.Spec.Replicas, true, o.Spec.Template.Spec)
+	case "VerticalPodAutoscaler":
+		if !strings.HasPrefix(meta.APIVersion, "autoscaling.k8s.io/") {
+			return nil
+		}
+		var o struct {
+			Metadata metav1.ObjectMeta `json:"metadata"`
+			Spec     struct {
+				TargetRef struct {
+					Kind string `json:"kind"`
+					Name string `json:"name"`
+				} `json:"targetRef"`
+				UpdatePolicy struct {
+					UpdateMode string `json:"updateMode"`
+				} `json:"updatePolicy"`
+				ResourcePolicy struct {
+					ContainerPolicies []struct {
+						ContainerName string `json:"containerName"`
+						Mode          string `json:"mode"`
+					} `json:"containerPolicies"`
+				} `json:"resourcePolicy"`
+			} `json:"spec"`
+			Status struct {
+				Recommendation struct {
+					ContainerRecommendations []struct {
+						ContainerName string                      `json:"containerName"`
+						Target        map[string]resourceQuantity `json:"target"`
+					} `json:"containerRecommendations"`
+				} `json:"recommendation"`
+			} `json:"status"`
+		}
+		if err := decode(&o); err != nil {
+			return err
+		}
+		v := VPA{Name: o.Metadata.Name, Namespace: o.Metadata.Namespace, TargetKind: o.Spec.TargetRef.Kind,
+			TargetName: o.Spec.TargetRef.Name, Mode: o.Spec.UpdatePolicy.UpdateMode, File: file}
+		if v.Namespace == "" {
+			v.Namespace = "default"
+		}
+		if v.Mode == "" {
+			v.Mode = "Auto"
+		}
+		for _, p := range o.Spec.ResourcePolicy.ContainerPolicies {
+			if p.Mode == "Off" {
+				v.OffContainers = append(v.OffContainers, p.ContainerName)
+			}
+		}
+		for _, r := range o.Status.Recommendation.ContainerRecommendations {
+			rec := VPARecommendation{Container: r.ContainerName}
+			if q, ok := r.Target["cpu"]; ok {
+				rec.CPUMillis = q.Quantity.MilliValue()
+			}
+			if q, ok := r.Target["memory"]; ok {
+				rec.MemBytes = q.Quantity.Value()
+			}
+			v.Recommendations = append(v.Recommendations, rec)
+		}
+		inv.VPAs = append(inv.VPAs, v)
 	case "ReplicaSet", "ReplicationController":
 		// Owned by a Deployment in practice: counted so the report can say what was left out.
 		inv.Skipped[meta.Kind]++
@@ -365,6 +490,11 @@ func firstLine(err error) string {
 	msg, _, _ := strings.Cut(err.Error(), "\n")
 	return msg
 }
+
+// resourceQuantity decodes a Kubernetes quantity ("140m", "720Mi") from JSON.
+type resourceQuantity struct{ Quantity resource.Quantity }
+
+func (q *resourceQuantity) UnmarshalJSON(b []byte) error { return q.Quantity.UnmarshalJSON(b) }
 
 // cpuRequest sums the CPU requests of the app containers, in millicores. Init containers run
 // before the app and do not add to the steady-state request.

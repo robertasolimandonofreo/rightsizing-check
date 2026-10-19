@@ -116,6 +116,28 @@ triggers:
     metricType: Utilization
     metadata: {value: "75"}`,
 	},
+	{
+		ID: "RC010", Kind: Caveat,
+		Title: "A VPA sets the requests of this workload",
+		Why:   "A VerticalPodAutoscaler that is not in Off mode writes the requests of the pods it controls. A request changed by hand in the manifest does not last: the VPA overwrites it the next time the pods are created. The recommendation here is only useful as a comparison with what the VPA does.",
+		Fix:   "Change the request through the VPA instead: set its minAllowed and maxAllowed, or put it in Off mode (recommendations only) and keep the requests in the manifest. A container can be taken out of the VPA's control with a resource policy with mode Off.",
+		Example: `apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+spec:
+  updatePolicy:
+    updateMode: Auto        # Off keeps the requests in the manifest
+  resourcePolicy:
+    containerPolicies:
+      - containerName: app
+        minAllowed: {cpu: 50m, memory: 128Mi}`,
+	},
+	{
+		ID: "RC011", Kind: Data,
+		Title:   "The VPA has its own recommendation",
+		Why:     "When the VPA object carries a status (read from a cluster, or a manifest exported from one), its target is shown next to this tool's recommendation. Two different numbers are a reason to look at the window each one uses: the VPA learns from the history that it has, this tool from the window you gave it.",
+		Fix:     "Compare the two before changing a request. A VPA in Off mode is a good source of a second opinion.",
+		Example: `kubectl get vpa -A -o yaml > vpa.yaml   # then scan it together with the manifests`,
+	},
 }
 
 // Lookup finds a rule by ID.

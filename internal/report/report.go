@@ -38,6 +38,8 @@ type Summary struct {
 	// ReclaimCPUUnderHPA is the part of the reclaimable CPU on workloads whose HPA would scale
 	// out if the request came down to the recommendation (RC009).
 	ReclaimCPUUnderHPA int64 `json:"reclaimableCPUMillisWithScaleOut"`
+	// ReclaimCPUUnderVPA is the part on workloads whose requests a VPA sets (RC010).
+	ReclaimCPUUnderVPA int64 `json:"reclaimableCPUMillisUnderVPA"`
 	ReclaimMemory      int64 `json:"reclaimableMemoryBytes"`
 	ReclaimCPUPercent  int   `json:"reclaimableCPUPercent"`
 	ReclaimMemPercent  int   `json:"reclaimableMemoryPercent"`
@@ -63,6 +65,9 @@ func Summarize(as []rightsize.Assessment, unmatched int) Summary {
 		s.ReclaimCPUMillis += a.ReclaimableCPU()
 		if a.ScalesOut {
 			s.ReclaimCPUUnderHPA += a.ReclaimableCPU()
+		}
+		if a.VPAControlled {
+			s.ReclaimCPUUnderVPA += a.ReclaimableCPU()
 		}
 		s.ReclaimMemory += a.ReclaimableMemory()
 	}
@@ -205,6 +210,9 @@ func summaryText(out io.Writer, s Summary, o Options) error {
 		if s.ReclaimCPUUnderHPA > 0 {
 			fmt.Fprintf(out, "Of the CPU, %s vCPU is on workloads whose HPA would scale out if the request came down to the recommendation (RC009): lower the target with it, or leave it.\n", cores(s.ReclaimCPUUnderHPA))
 		}
+		if s.ReclaimCPUUnderVPA > 0 {
+			fmt.Fprintf(out, "Of the CPU, %s vCPU is on workloads whose requests a VPA sets (RC010): change them through the VPA, because an edit in the manifest will be overwritten.\n", cores(s.ReclaimCPUUnderVPA))
+		}
 		if o.CPUPrice > 0 || o.MemPrice > 0 {
 			cost := float64(s.ReclaimCPUMillis)/1000*o.CPUPrice + float64(s.ReclaimMemory)/(1<<30)*o.MemPrice
 			fmt.Fprintf(out, "At your prices that is about %.0f per month in requests. It only becomes savings once the nodes consolidate.\n", cost)
@@ -230,6 +238,8 @@ type jsonWorkload struct {
 	Findings   []rightsize.Finding   `json:"findings"`
 	// AutoscaledBy names the HPAs and ScaledObjects that target the workload.
 	AutoscaledBy []string `json:"autoscaledBy,omitempty"`
+	// ControlledBy names the VPAs that target the workload.
+	ControlledBy []string `json:"controlledBy,omitempty"`
 }
 
 // JSON writes a machine-readable report that starts with schemaVersion and toolVersion.
@@ -247,7 +257,7 @@ func JSON(out io.Writer, as []rightsize.Assessment, o Options) error {
 			ID: a.Workload.ID(), Kind: a.Workload.Kind, Namespace: a.Workload.Namespace,
 			Name: a.Workload.Name, File: a.Workload.File, Status: a.Status,
 			ReclaimCPU: a.ReclaimableCPU(), ReclaimMem: a.ReclaimableMemory(),
-			Containers: a.Containers, Findings: a.Findings, AutoscaledBy: a.AutoscaledBy,
+			Containers: a.Containers, Findings: a.Findings, AutoscaledBy: a.AutoscaledBy, ControlledBy: a.ControlledBy,
 		}
 		if a.Workload.LongRunning {
 			r := a.Workload.Replicas

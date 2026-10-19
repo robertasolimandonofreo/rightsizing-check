@@ -64,7 +64,7 @@ func podOf(w inventory.Workload, pod string) bool {
 	if w.Kind == "Pod" {
 		return pod == w.Name
 	}
-	if (w.Kind == "Deployment" || w.Kind == "DaemonSet") && truncatedPod(w.Name, pod) {
+	if (w.Kind == "Deployment" || w.Kind == "Rollout" || w.Kind == "DaemonSet") && truncatedPod(w.Name, pod) {
 		return true
 	}
 	rest, ok := strings.CutPrefix(pod, w.Name+"-")
@@ -74,7 +74,7 @@ func podOf(w inventory.Workload, pod string) bool {
 	switch w.Kind {
 	case "StatefulSet":
 		return isOrdinal(rest)
-	case "Deployment":
+	case "Deployment", "Rollout":
 		hash, suffix, found := strings.Cut(rest, "-")
 		return found && isGenerated(hash, 6, 10) && isGenerated(suffix, 5, 5)
 	case "DaemonSet":

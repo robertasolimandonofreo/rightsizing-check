@@ -250,7 +250,9 @@ func scan(args []string, env Env) int {
 	matches := rightsize.Match(inv.Workloads, data.Samples)
 	assessments := make([]rightsize.Assessment, 0, len(inv.Workloads))
 	for i, w := range inv.Workloads {
-		assessments = append(assessments, rightsize.Evaluate(w, matches.ByWorkload[i], cfg, rightsize.ScalersFor(w, inv.Autoscalers)))
+		a := rightsize.Evaluate(w, matches.ByWorkload[i], cfg, rightsize.ScalersFor(w, inv.Autoscalers))
+		rightsize.AddVPAFindings(&a, rightsize.VPAsFor(w, inv.VPAs))
+		assessments = append(assessments, a)
 	}
 
 	ro := report.Options{Verbose: verbose, Version: env.Version, Unmatched: matches.Unmatched,
