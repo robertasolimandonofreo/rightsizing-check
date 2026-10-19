@@ -1,15 +1,16 @@
 # rightsizing-check
 
 Finds Kubernetes CPU and memory requests that are far above what the containers use, and says what
-to set instead. It works **offline**: it reads your manifests and a usage file that you exported,
-and never connects to a cluster or a metrics server.
+to set instead. By default it works **offline**: it reads your manifests and a usage file that you
+exported, and never connects to a cluster. Optionally it reads the usage straight from a Prometheus
+(`--prometheus`, with a `--window` such as `7d`), with plain read-only GET requests.
 
 The scheduler reserves what a pod *requests*, not what it uses. A request four times the real usage
 keeps nodes half empty, and Karpenter cannot consolidate pods that say they need the capacity.
 `rightsizing-check` lists the requests to lower, how much they free, and the workloads that are
 under-requested, which are a risk of their own.
 
-> **Status: early (v0.1.0).** It reads manifests and three kinds of usage file. It is not a
+> **Status: early (v0.3.0).** It reads manifests and four kinds of usage input. It is not a
 > recommender that applies changes: it never edits your files. See [Limits](#limits).
 
 ## Why another one
@@ -17,7 +18,8 @@ under-requested, which are a risk of their own.
 [Goldilocks](https://github.com/FairwindsOps/goldilocks) and [KRR](https://github.com/robusta-dev/krr)
 exist and are good. They run against a live cluster or a Prometheus. This one is for when you
 cannot or do not want to: a CI job, a review of a client's cluster from files, an air-gapped
-environment. You export the numbers once and the analysis is a pure function of your files.
+environment. You export the numbers once and the analysis is a pure function of your files. When
+you do have a Prometheus, `--prometheus` fetches the two queries for you.
 
 ## Install
 
@@ -47,6 +49,7 @@ go install github.com/robertasolimandonofreo/rightsizing-check/cmd/rightsizing-c
 ## Use
 
 ```bash
+rightsizing-check scan ./k8s --prometheus https://prometheus.example.com --window 7d
 rightsizing-check scan ./k8s --csv usage.csv
 rightsizing-check scan ./k8s --prom-cpu cpu.json --prom-mem mem.json
 rightsizing-check scan ./k8s --top top.txt -n shop
@@ -73,10 +76,34 @@ no-data     shop/cronjob/report          report     -         -        ?        
 
 ## Getting the usage data
 
-Pick one. The first is the one to trust.
+Pick one. The first two are the ones to trust.
 
-**Prometheus (recommended).** Two instant queries, over a window that includes your busiest period
-(7 days is a good start). Export each result as it comes:
+**Straight from Prometheus.** One flag fetches both queries below and reads the result, over the
+window you choose (it must include your busiest period; 7 days is a good start):
+
+```bash
+rightsizing-check scan ./k8s --prometheus https://prometheus.example.com --window 7d
+rightsizing-check scan ./k8s --prometheus https://prometheus.example.com --window 1d \
+  --prom-selector 'namespace=~"shop|nps"'          # a part of the cluster at a time
+PROM_TOKEN=... rightsizing-check scan ./k8s --prometheus https://prometheus.example.com \
+  --prom-token-env PROM_TOKEN                      # a bearer token, read from the environment
+```
+
+The address can be the one of the web UI (`/query` and `/graph` are removed). It only sends GET
+requests to `/api/v1/query`, one query at a time, the memory one first. The window is any
+Prometheus duration (`7d`, `168h`, `2w`).
+
+**A long window is heavy.** The CPU query is a subquery over the whole window, so its cost grows
+with the number of series times the window. On a small Prometheus a 14-day window made the pod use
+enough memory to be evicted by the kubelet while this tool was being tested against a real server
+(a 7-day window over about 190 thousand series took 45 seconds and was fine). So a window over 7
+days is refused unless you pass `--prom-allow-long-window`. Start with `1d` or `7d`, read a few
+namespaces at a time with `--prom-selector`, avoid peak hours, and never retry a query that answered
+504 or 503: the server may still be running it. `--prom-timeout` (default 3 minutes) bounds each
+query.
+
+**By hand, from the same queries.** Two instant queries, over the same window. Export each result as
+it comes:
 
 ```bash
 PROM=http://prometheus:9090
@@ -90,8 +117,8 @@ curl -sG "$PROM/api/v1/query" --data-urlencode \
   'query=max by (namespace, pod, container) (max_over_time(container_memory_working_set_bytes{container!="",container!="POD"}[7d]))' > mem.json
 ```
 
-Use `/api/v1/query`, not `query_range`: the tool wants one value per container. The CPU query is a
-subquery and can be heavy on a large Prometheus: shorten the window, or query per namespace.
+Use `/api/v1/query`, not `query_range`: the tool wants one value per container. The same caution
+about the window applies, and you then pass the files with `--prom-cpu` and `--prom-mem`.
 
 **CSV.** From Grafana, a notebook or anywhere else. The header is required, and a blank value means
 that number is not known:
