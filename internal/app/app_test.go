@@ -3,6 +3,8 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -238,5 +240,59 @@ spec:
 	_, table, _ := run(t, "", "scan", filepath.Join(dir, "m.yaml"), "--csv", usageCSV)
 	if !strings.Contains(table, "would scale out if the request came down") {
 		t.Errorf("the table summary should explain it:\n%s", table)
+	}
+}
+
+func fakePrometheus(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Query().Get("query"), "[30d") {
+			t.Errorf("the --window must reach the query: %q", r.URL.Query().Get("query"))
+		}
+		series := func(v string) string {
+			return `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"namespace":"shop","pod":"api-5d8f7c9b6-x2k4j","container":"app"},"value":[1,"` + v + `"]}]}}`
+		}
+		if strings.Contains(r.URL.Query().Get("query"), "container_cpu_usage_seconds_total") {
+			_, _ = w.Write([]byte(series("0.04")))
+			return
+		}
+		_, _ = w.Write([]byte(series("104857600")))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestScanReadsUsageFromPrometheus(t *testing.T) {
+	srv := fakePrometheus(t)
+	dir := t.TempDir()
+	m := filepath.Join(dir, "m.yaml")
+	os.WriteFile(m, []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: api, namespace: shop}\nspec:\n  replicas: 2\n  template:\n    spec:\n      containers:\n        - {name: app, image: a:1, resources: {requests: {cpu: 500m, memory: 1Gi}}}\n"), 0o600)
+	code, out, errOut := run(t, "", "scan", m, "--prometheus", srv.URL+"/query", "--window", "30d", "--prom-allow-long-window")
+	if code != exitOK {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	if !strings.Contains(out, "oversized") || strings.Contains(out, "RC008") {
+		t.Errorf("a Prometheus window is not a snapshot, and the workload is oversized:\n%s", out)
+	}
+	if !strings.Contains(errOut, "reading usage from") || !strings.Contains(errOut, "over 30d") || !strings.Contains(errOut, "read 1 CPU and 1 memory series") {
+		t.Errorf("progress on stderr = %q", errOut)
+	}
+}
+
+func TestPrometheusOptionErrors(t *testing.T) {
+	dir := t.TempDir()
+	m := filepath.Join(dir, "m.yaml")
+	os.WriteFile(m, []byte("apiVersion: v1\nkind: Pod\nmetadata: {name: p}\nspec: {containers: [{name: c, image: c:1}]}\n"), 0o600)
+	for _, args := range [][]string{
+		{"scan", m, "--prometheus", "not a url"},
+		{"scan", m, "--prometheus", "https://prom.example.invalid", "--window", "seven"},
+		{"scan", m, "--prometheus", "https://prom.example.invalid", "--prom-timeout", "soon"},
+		{"scan", m, "--prometheus", "https://prom.example.invalid", "--window", "14d"},
+		{"scan", m, "--prometheus", "https://prom.example.invalid", "--prom-token-env", "RIGHTSIZING_TEST_TOKEN_UNSET"},
+		{"scan", m, "--prometheus", "https://prom.example.invalid", "--prom-selector", `namespace="a"}`},
+	} {
+		if code, _, _ := run(t, "", args...); code != exitUsage {
+			t.Errorf("%v: exit = %d, want %d", args[2:], code, exitUsage)
+		}
 	}
 }

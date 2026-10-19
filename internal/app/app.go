@@ -2,13 +2,18 @@
 package app
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"time"
 
 	"github.com/robertasolimandonofreo/rightsizing-check/internal/inventory"
+	"github.com/robertasolimandonofreo/rightsizing-check/internal/prom"
 	"github.com/robertasolimandonofreo/rightsizing-check/internal/report"
 	"github.com/robertasolimandonofreo/rightsizing-check/internal/rightsize"
 	"github.com/robertasolimandonofreo/rightsizing-check/internal/usage"
@@ -27,6 +32,8 @@ type Env struct {
 	Stdout  io.Writer
 	Stderr  io.Writer
 	Version string
+	// HTTPClient replaces the one used for Prometheus. Tests use it; nil means the default.
+	HTTPClient *http.Client
 }
 
 const usageText = `rightsizing-check finds Kubernetes CPU and memory requests that are far above what the containers use.
@@ -37,7 +44,13 @@ Usage:
   rightsizing-check explain <rule>            describe a rule, for example RC001
   rightsizing-check version
 
-Usage files (at least one):
+Usage data (at least one source):
+      --prometheus <url>       read it from Prometheus: GET /api/v1/query, nothing else
+      --window <duration>      the window to read, for example 7d, 14d or 168h (default 7d)
+      --prom-selector <m>      extra label matchers, for example namespace=~"shop|nps"
+      --prom-token-env <VAR>   environment variable that holds a bearer token
+      --prom-timeout <dur>     limit for each query (default 3m)
+      --prom-allow-long-window allow a --window over 7d (heavy: it can overload a small Prometheus)
       --prom-cpu <file>        Prometheus instant-query JSON, CPU in cores
       --prom-mem <file>        Prometheus instant-query JSON, memory in bytes
       --top <file>             output of: kubectl top pods -A --containers
@@ -100,7 +113,8 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 func scan(args []string, env Env) int {
 	var (
 		format, failOn, promCPU, promMem, top, csvFile, namespace string
-		verbose                                                   bool
+		promURL, window, selector, tokenEnv, promTimeout          string
+		verbose, allowLong                                        bool
 		cfg                                                       = rightsize.DefaultConfig()
 		cpuPrice, memPrice                                        float64
 	)
@@ -115,6 +129,12 @@ func scan(args []string, env Env) int {
 	fs.StringVar(&csvFile, "csv", "", "")
 	fs.StringVar(&namespace, "namespace", "default", "")
 	fs.StringVar(&namespace, "n", "default", "")
+	fs.StringVar(&promURL, "prometheus", "", "")
+	fs.StringVar(&window, "window", "7d", "")
+	fs.StringVar(&selector, "prom-selector", "", "")
+	fs.StringVar(&tokenEnv, "prom-token-env", "", "")
+	fs.StringVar(&promTimeout, "prom-timeout", "3m", "")
+	fs.BoolVar(&allowLong, "prom-allow-long-window", false, "")
 	fs.BoolVar(&verbose, "verbose", false, "")
 	fs.BoolVar(&verbose, "v", false, "")
 	fs.Float64Var(&cfg.Slack, "slack", cfg.Slack, "")
@@ -133,8 +153,8 @@ func scan(args []string, env Env) int {
 	if len(paths) == 0 {
 		return fail("scan needs at least one path (a file, a directory, or - for stdin)")
 	}
-	if promCPU == "" && promMem == "" && top == "" && csvFile == "" {
-		return fail("scan needs usage data: pass --prom-cpu, --prom-mem, --top or --csv (see the README)")
+	if promURL == "" && promCPU == "" && promMem == "" && top == "" && csvFile == "" {
+		return fail("scan needs usage data: pass --prometheus, --prom-cpu, --prom-mem, --top or --csv (see the README)")
 	}
 	switch format {
 	case "table", "json", "markdown", "md":
@@ -201,6 +221,30 @@ func scan(args []string, env Env) int {
 		if err := load(step.path, step.parse); err != nil {
 			return fail("error: %v", err)
 		}
+	}
+
+	if promURL != "" {
+		timeout, err := time.ParseDuration(promTimeout)
+		if err != nil || timeout <= 0 {
+			return fail("invalid --prom-timeout %q (use a duration such as 3m)", promTimeout)
+		}
+		token := ""
+		if tokenEnv != "" {
+			if token = os.Getenv(tokenEnv); token == "" {
+				return fail("--prom-token-env %s is empty or not set", tokenEnv)
+			}
+		}
+		fmt.Fprintf(env.Stderr, "reading usage from %s over %s (read-only)...\n", prom.Host(promURL), window)
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		started := time.Now()
+		cpu, mem, err := prom.Fetch(ctx, prom.Options{BaseURL: promURL, Window: window, Selector: selector, Token: token, Timeout: timeout, AllowLongWindow: allowLong, Client: env.HTTPClient})
+		stop()
+		if err != nil {
+			return fail("error: %v", err)
+		}
+		fmt.Fprintf(env.Stderr, "read %d CPU and %d memory series in %s\n", len(cpu), len(mem), time.Since(started).Round(100*time.Millisecond))
+		data.Merge(cpu)
+		data.Merge(mem)
 	}
 
 	matches := rightsize.Match(inv.Workloads, data.Samples)
