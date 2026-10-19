@@ -1,0 +1,55 @@
+name: action
+# Runs the action of this repository on a pull request, with the code of the pull request, so a
+# change to action.yml is tested before it is released.
+on:
+  pull_request:
+    paths:
+      - action.yml
+      - .github/workflows/action.yml
+      - testdata/**
+      - internal/**
+      - cmd/**
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  dogfood:
+    runs-on: ubuntu-latest
+    # A pull request from a fork gets a read-only token and cannot comment.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build -o "$RUNNER_TEMP/bin/rightsizing-check" ./cmd/rightsizing-check && echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - id: scan
+        uses: ./
+        with:
+          version: local
+          path: testdata/sample.yaml
+          csv: testdata/usage.csv
+          comment: "true"
+          cpu-price: "25"
+          mem-price: "4"
+      - name: The outputs are filled
+        env:
+          CPU: ${{ steps.scan.outputs.reclaimable-cpu-percent }}
+          OVERSIZED: ${{ steps.scan.outputs.oversized }}
+          UNDERSIZED: ${{ steps.scan.outputs.undersized }}
+        run: |
+          test -n "$CPU" && test "$OVERSIZED" = "2" && test "$UNDERSIZED" = "2"
+          echo "reclaimable CPU: $CPU%, oversized $OVERSIZED, undersized $UNDERSIZED"
+      - name: fail-on is applied after the comment
+        id: failon
+        uses: ./
+        continue-on-error: true
+        with:
+          version: local
+          path: testdata/sample.yaml
+          csv: testdata/usage.csv
+          fail-on: undersized
+      - name: The job failed on purpose
+        env:
+          OUTCOME: ${{ steps.failon.outcome }}
+        run: test "$OUTCOME" = "failure"

@@ -3,14 +3,16 @@
 Finds Kubernetes CPU and memory requests that are far above what the containers use, and says what
 to set instead. By default it works **offline**: it reads your manifests and a usage file that you
 exported, and never connects to a cluster. Optionally it reads the usage straight from a Prometheus
-(`--prometheus`, with a `--window` such as `7d`), with plain read-only GET requests.
+(`--prometheus`, with a `--window` such as `7d`), with plain read-only GET requests. It can also
+read the workloads straight from a cluster (`--cluster`, list calls only), and it is a GitHub Action
+that comments on the pull request.
 
 The scheduler reserves what a pod *requests*, not what it uses. A request four times the real usage
 keeps nodes half empty, and Karpenter cannot consolidate pods that say they need the capacity.
 `rightsizing-check` lists the requests to lower, how much they free, and the workloads that are
 under-requested, which are a risk of their own.
 
-> **Status: early (v0.3.0).** It reads manifests and four kinds of usage input. It is not a
+> **Status: early (v0.4.0).** It reads manifests or a live cluster, and four kinds of usage input. It is not a
 > recommender that applies changes: it never edits your files. See [Limits](#limits).
 
 ## Why another one
@@ -50,6 +52,8 @@ go install github.com/robertasolimandonofreo/rightsizing-check/cmd/rightsizing-c
 
 ```bash
 rightsizing-check scan ./k8s --prometheus https://prometheus.example.com --window 7d
+rightsizing-check scan --cluster --prometheus https://prometheus.example.com   # the cluster itself
+rightsizing-check scan --cluster                                 # usage from metrics-server (an instant)
 rightsizing-check scan ./k8s --csv usage.csv
 rightsizing-check scan ./k8s --prom-cpu cpu.json --prom-mem mem.json
 rightsizing-check scan ./k8s --top top.txt -n shop
@@ -178,6 +182,8 @@ utilization under about 58%. The headrooms are `--cpu-headroom` and `--mem-headr
 | RC007 | data  | No usage found for the container                                     |
 | RC008 | data  | Usage is a `kubectl top` snapshot, not a window                      |
 | RC009 | caveat | An HPA or KEDA scaler on CPU or memory utilization would scale out if the request came down to the recommendation |
+| RC010 | caveat | A VPA that is not in Off mode sets the requests of this workload, so a change by hand is overwritten |
+| RC011 | data  | The VPA has its own recommendation (shown next to this tool's)                       |
 
 `rightsizing-check explain RC001` documents any rule, with a problem and a fix.
 
@@ -198,6 +204,104 @@ Scalers that do not depend on the request are ignored: `AverageValue` targets, a
 trigger (RabbitMQ, Prometheus, cron, HTTP). The summary adds how much of the reclaimable CPU sits on
 such workloads. Scan the folder that holds your HPAs and ScaledObjects too, or export them from the
 cluster (`kubectl get hpa -A -o yaml > hpa.yaml`) and pass the file.
+
+## VPAs and Argo Rollouts
+
+A VerticalPodAutoscaler that is not in `Off` mode (`Auto`, `Recreate`, `Initial` or
+`InPlaceOrRecreate`; an unset mode is `Auto`) writes the requests of the pods it controls, so a
+request changed by hand in the manifest does not last. When this tool would change a request that a
+VPA controls, RC010 says so, and the summary adds how much of the reclaimable CPU sits on such
+workloads: change those through the VPA (`minAllowed`, `maxAllowed`, or `Off` mode), not in the
+manifest. A container that a resource policy takes out of the VPA (`mode: "Off"`) is not counted.
+
+When the VPA object carries a status (a live cluster, or a manifest exported with
+`kubectl get vpa -A -o yaml`), RC011 shows its target next to this tool's recommendation. The two can
+differ because each learns from a different window.
+
+An Argo `Rollout` with a pod template is analyzed like a Deployment, and its pods are matched the
+same way. A Rollout that points at a Deployment (`workloadRef`) has no template of its own: the
+Deployment is the workload that is analyzed.
+
+## Live cluster
+
+`--cluster` reads the workloads, the HPAs, the KEDA ScaledObjects, the VPAs and the Argo Rollouts
+from the cluster instead of from files, and the usage of every container from the metrics API
+(`metrics.k8s.io`, what `kubectl top` reads) unless you give another usage source.
+
+```bash
+rightsizing-check scan --cluster                                  # the current kubeconfig context
+rightsizing-check scan --cluster --context prod -n shop           # one context, one namespace
+rightsizing-check scan --cluster --prometheus https://prometheus.example.com --window 7d
+```
+
+It is **read-only**: only `list` calls are ever sent (the tests check that no other verb is used),
+paged by 500 objects and limited to a few requests a second, one resource at a time. A custom
+resource that is not installed is skipped with a note. The minimum RBAC:
+
+```yaml
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["list"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["list"]
+  - apiGroups: ["argoproj.io", "keda.sh", "autoscaling.k8s.io"]
+    resources: ["rollouts", "scaledobjects", "verticalpodautoscalers"]
+    verbs: ["list"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["list"]
+```
+
+Only Deployments, StatefulSets, DaemonSets and Rollouts are read: Jobs and CronJobs are not matched
+to pods anyway. The usage from metrics-server is one instant and is flagged (RC008): with
+`--prometheus` the metrics API is not read at all. Without `-n`, every namespace is read (`-n`
+means the namespace of the `kubectl top` file only when `--cluster` is not used).
+
+## GitHub Action
+
+The repository is also a GitHub Action: it installs the release that matches its version (checking
+the checksum), scans, adds the report to the job summary and, optionally, comments on the pull
+request and fails the job.
+
+```yaml
+name: rightsizing
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write      # only needed when comment is true
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: robertasolimandonofreo/rightsizing-check@v0.4.0
+        with:
+          path: ./k8s
+          prometheus: https://prometheus.example.com
+          window: 7d
+          prom-token: ${{ secrets.PROM_TOKEN }}   # optional
+          comment: "true"
+          fail-on: undersized
+```
+
+| Input | Default | |
+| --- | --- | --- |
+| `path` | `.` | Files or directories to scan, separated by spaces |
+| `csv`, `prom-cpu`, `prom-mem`, `top`, `top-namespace` | empty | Usage from a file in the workspace |
+| `prometheus`, `window`, `prom-selector`, `prom-token`, `allow-long-window` | empty, `7d` | Usage straight from a Prometheus |
+| `fail-on` | empty | `undersized`, or `oversized` (which includes it). The comment is posted first |
+| `comment` | `false` | Comment on the pull request, and keep that one comment updated |
+| `slack`, `cpu-price`, `mem-price` | empty | The options of the same name |
+| `version` | the action's version | A release such as `v0.4.0`; `local` uses the binary on the `PATH` |
+| `github-token` | `github.token` | Token used to comment |
+
+Outputs: `reclaimable-cpu-percent`, `reclaimable-memory-percent`, `oversized`, `undersized`, `ok` and
+`no-data`. It runs on Linux and macOS runners. The comment is found by its marker, so it never
+edits the comment of another tool. On pull requests from forks `GITHUB_TOKEN` is read-only, so
+`comment` fails there. With `prometheus`, the usage is read **once** per run, and a window over 7d
+is refused unless `allow-long-window` is `true`: see [the cost of a long window](#getting-the-usage-data).
 
 ## What the numbers mean
 
@@ -232,7 +336,7 @@ recommendation, reclaimable) and its findings.
 - **Memory is not compressible.** A request is a reservation, but a memory limit below the usage
   kills the container. Prefer the maximum over the window for memory, and do not shrink a container
   flagged RC005 before you know why it is close to its limit.
-- **CPU limits are not analyzed**, and neither are VPAs, init containers or sidecars injected at
+- **CPU limits are not analyzed**, and neither are init containers or sidecars injected at
   admission (they have no entry in the manifest).
 - Pods are matched to workloads by name. A custom `generateName`, or a CRD that creates pods, is
   not recognized and shows up as unmatched.
@@ -241,8 +345,8 @@ recommendation, reclaimable) and its findings.
 
 ## Roadmap
 
-Reading VPAs and Argo Rollouts, a live-cluster mode (read-only), and a GitHub Action with a pull
-request comment. None of it is started.
+Comparing with the base branch of a pull request, so that only a new finding fails the build, and
+SARIF output, as spot-readiness does. Reading Jobs and CronJobs. None of it is started.
 
 ## Related
 

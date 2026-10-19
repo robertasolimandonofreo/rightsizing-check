@@ -20,3 +20,20 @@ jobs:
       - run: go run ./cmd/rightsizing-check scan testdata/sample.yaml --csv testdata/usage.csv
       - run: go run ./cmd/rightsizing-check scan -f json testdata/sample.yaml --csv testdata/usage.csv > /dev/null
       - run: go run ./cmd/rightsizing-check explain RC001
+
+  # action.yml holds a lot of bash (the install with its checksum, the scan, the comment) and the
+  # workflows call it, so both are linted: actionlint for the workflows, shellcheck for the steps
+  # of the action.
+  lint-actions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: actionlint
+        run: |
+          curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz | tar -xz actionlint
+          ./actionlint -color
+      - name: shellcheck on the steps of action.yml
+        run: go run ./.github/scripts/shellcheck-action

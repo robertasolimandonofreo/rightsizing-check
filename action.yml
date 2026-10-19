@@ -1,0 +1,222 @@
+name: rightsizing-check
+description: Find Kubernetes CPU and memory requests far above real usage. Scans manifests against an exported usage file or a Prometheus, and comments on the pull request.
+author: Roberta Soliman
+branding:
+  icon: server
+  color: blue
+
+inputs:
+  path:
+    description: Files or directories to scan, separated by spaces.
+    default: "."
+  csv:
+    description: Usage CSV (namespace,pod,container,cpu_millis,memory_bytes), a path in the workspace.
+    default: ""
+  prom-cpu:
+    description: Prometheus instant-query JSON with the CPU usage in cores, a path in the workspace. Use with prom-mem.
+    default: ""
+  prom-mem:
+    description: Prometheus instant-query JSON with the memory usage in bytes, a path in the workspace. Use with prom-cpu.
+    default: ""
+  top:
+    description: Output of kubectl top pods -A --containers, a path in the workspace. It is one instant, the weakest source.
+    default: ""
+  top-namespace:
+    description: Namespace of the top file when it was taken without -A.
+    default: default
+  prometheus:
+    description: Address of a Prometheus to read the usage from, with plain GET requests. Reading a Prometheus has a cost, see the README.
+    default: ""
+  window:
+    description: Window to read from the Prometheus, for example 7d. A window over 7d is refused unless allow-long-window is true.
+    default: 7d
+  prom-selector:
+    description: Extra label matchers for both Prometheus queries, for example namespace=~"shop|nps".
+    default: ""
+  prom-token:
+    description: Bearer token for the Prometheus. Pass it from a secret.
+    default: ""
+  allow-long-window:
+    description: Allow a window over 7d. The CPU query is a subquery over the whole window and can overload a small Prometheus.
+    default: "false"
+  fail-on:
+    description: Fail the job when a workload is "undersized", or "oversized" (which includes undersized). Empty never fails.
+    default: ""
+  comment:
+    description: Post (and keep updating) a comment on the pull request.
+    default: "false"
+  slack:
+    description: A request is inflated above this many times the recommendation. Empty uses the default of the tool.
+    default: ""
+  cpu-price:
+    description: Price of a vCPU per month, to add a cost line to the report.
+    default: ""
+  mem-price:
+    description: Price of a GiB per month, to add a cost line to the report.
+    default: ""
+  version:
+    description: rightsizing-check version to run, for example v0.4.0. Defaults to the version of this action when it is used with a version tag, otherwise the latest release. "local" skips the install and uses the rightsizing-check that is already on the PATH.
+    default: ""
+  github-token:
+    description: Token used to comment on the pull request (needs pull-requests write permission).
+    default: ${{ github.token }}
+
+outputs:
+  reclaimable-cpu-percent:
+    description: Share of the requested CPU that the recommendations free.
+    value: ${{ steps.scan.outputs.reclaimable-cpu-percent }}
+  reclaimable-memory-percent:
+    description: Share of the requested memory that the recommendations free.
+    value: ${{ steps.scan.outputs.reclaimable-memory-percent }}
+  oversized:
+    description: Number of oversized workloads.
+    value: ${{ steps.scan.outputs.oversized }}
+  undersized:
+    description: Number of undersized workloads.
+    value: ${{ steps.scan.outputs.undersized }}
+  ok:
+    description: Number of workloads whose requests are close to the usage.
+    value: ${{ steps.scan.outputs.ok }}
+  no-data:
+    description: Number of workloads without usage data.
+    value: ${{ steps.scan.outputs.no-data }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install rightsizing-check
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        ACTION_REF: ${{ github.action_ref }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        RUNNER_OS_NAME: ${{ runner.os }}
+        RUNNER_ARCH_NAME: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+        if [ "$INPUT_VERSION" = "local" ]; then
+          command -v rightsizing-check >/dev/null || { echo "::error::version 'local' needs rightsizing-check on the PATH"; exit 1; }
+          echo "Using the rightsizing-check on the PATH"
+          exit 0
+        fi
+        case "$RUNNER_OS_NAME" in
+          Linux) os=linux ;;
+          macOS) os=darwin ;;
+          *) echo "::error::rightsizing-check supports Linux and macOS runners, not $RUNNER_OS_NAME"; exit 1 ;;
+        esac
+        case "$RUNNER_ARCH_NAME" in
+          X64) arch=amd64 ;;
+          ARM64) arch=arm64 ;;
+          *) echo "::error::unsupported runner architecture $RUNNER_ARCH_NAME"; exit 1 ;;
+        esac
+
+        version="$INPUT_VERSION"
+        if [ -z "$version" ] && [[ "$ACTION_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          version="$ACTION_REF"
+        fi
+        if [ -z "$version" ]; then
+          version=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/robertasolimandonofreo/rightsizing-check/releases/latest | jq -r .tag_name)
+        fi
+        [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::invalid version '$version'"; exit 1; }
+
+        archive="rightsizing-check_${version#v}_${os}_${arch}.tar.gz"
+        base="https://github.com/robertasolimandonofreo/rightsizing-check/releases/download/${version}"
+        dir="$RUNNER_TEMP/rightsizing-check"
+        mkdir -p "$dir"
+        curl -fsSL -o "$dir/$archive" "$base/$archive"
+        curl -fsSL -o "$dir/checksums.txt" "$base/checksums.txt"
+        (cd "$dir" && grep " $archive\$" checksums.txt | { sha256sum -c - 2>/dev/null || shasum -a 256 -c -; })
+        tar -xzf "$dir/$archive" -C "$dir" rightsizing-check
+        echo "$dir" >> "$GITHUB_PATH"
+        echo "Installed rightsizing-check $version"
+
+    - name: Scan
+      id: scan
+      shell: bash
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_CSV: ${{ inputs.csv }}
+        INPUT_PROM_CPU: ${{ inputs.prom-cpu }}
+        INPUT_PROM_MEM: ${{ inputs.prom-mem }}
+        INPUT_TOP: ${{ inputs.top }}
+        INPUT_TOP_NAMESPACE: ${{ inputs.top-namespace }}
+        INPUT_PROMETHEUS: ${{ inputs.prometheus }}
+        INPUT_WINDOW: ${{ inputs.window }}
+        INPUT_PROM_SELECTOR: ${{ inputs.prom-selector }}
+        PROM_TOKEN: ${{ inputs.prom-token }}
+        INPUT_ALLOW_LONG_WINDOW: ${{ inputs.allow-long-window }}
+        INPUT_FAIL_ON: ${{ inputs.fail-on }}
+        INPUT_SLACK: ${{ inputs.slack }}
+        INPUT_CPU_PRICE: ${{ inputs.cpu-price }}
+        INPUT_MEM_PRICE: ${{ inputs.mem-price }}
+      run: |
+        set -uo pipefail
+        flags=()
+        [ -n "$INPUT_CSV" ] && flags+=(--csv "$INPUT_CSV")
+        [ -n "$INPUT_PROM_CPU" ] && flags+=(--prom-cpu "$INPUT_PROM_CPU")
+        [ -n "$INPUT_PROM_MEM" ] && flags+=(--prom-mem "$INPUT_PROM_MEM")
+        [ -n "$INPUT_TOP" ] && flags+=(--top "$INPUT_TOP" -n "$INPUT_TOP_NAMESPACE")
+        if [ -n "$INPUT_PROMETHEUS" ]; then
+          flags+=(--prometheus "$INPUT_PROMETHEUS" --window "$INPUT_WINDOW")
+          [ -n "$INPUT_PROM_SELECTOR" ] && flags+=(--prom-selector "$INPUT_PROM_SELECTOR")
+          # The token stays in the environment: it never goes on a command line.
+          [ -n "$PROM_TOKEN" ] && flags+=(--prom-token-env PROM_TOKEN)
+          [ "$INPUT_ALLOW_LONG_WINDOW" = "true" ] && flags+=(--prom-allow-long-window)
+        fi
+        [ -n "$INPUT_FAIL_ON" ] && flags+=(--fail-on "$INPUT_FAIL_ON")
+        [ -n "$INPUT_SLACK" ] && flags+=(--slack "$INPUT_SLACK")
+        [ -n "$INPUT_CPU_PRICE" ] && flags+=(--cpu-price "$INPUT_CPU_PRICE")
+        [ -n "$INPUT_MEM_PRICE" ] && flags+=(--mem-price "$INPUT_MEM_PRICE")
+
+        report="$RUNNER_TEMP/rightsizing-check-report.md"
+        json="$RUNNER_TEMP/rightsizing-check.json"
+        # One run writes both formats: with a Prometheus, a second run would read the server again.
+        # Word splitting of the path input is intended: it is a space-separated list.
+        # shellcheck disable=SC2086
+        rightsizing-check scan ${flags[@]+"${flags[@]}"} -f markdown --json-file "$json" $INPUT_PATH > "$report"
+        status=$?
+        # Exit 1 means the fail-on level was reached: still comment, fail afterwards.
+        threshold_failed=false
+        if [ $status -eq 1 ]; then threshold_failed=true
+        elif [ $status -ne 0 ]; then cat "$report"; exit $status; fi
+
+        {
+          echo "reclaimable-cpu-percent=$(jq .summary.reclaimableCPUPercent "$json")"
+          echo "reclaimable-memory-percent=$(jq .summary.reclaimableMemoryPercent "$json")"
+          echo "oversized=$(jq '.summary.counts.oversized // 0' "$json")"
+          echo "undersized=$(jq '.summary.counts.undersized // 0' "$json")"
+          echo "ok=$(jq '.summary.counts.ok // 0' "$json")"
+          echo "no-data=$(jq '.summary.counts["no-data"] // 0' "$json")"
+          echo "threshold-failed=$threshold_failed"
+        } >> "$GITHUB_OUTPUT"
+        cat "$report" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Comment on the pull request
+      if: inputs.comment == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        GH_REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        report="$RUNNER_TEMP/rightsizing-check-report.md"
+        # The report starts with a marker, so this finds its own comment and not the comment of
+        # another tool (gh pr comment --edit-last would edit whichever was posted last).
+        marker='<!-- rightsizing-check -->'
+        id=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER/comments" --paginate \
+          --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | tail -n 1)
+        if [ -n "$id" ]; then
+          gh api --method PATCH "repos/$GH_REPO/issues/comments/$id" --field body=@"$report" >/dev/null
+          echo "Updated the comment $id"
+        else
+          gh pr comment "$PR_NUMBER" --body-file "$report"
+        fi
+
+    - name: Apply the fail-on level
+      if: steps.scan.outputs.threshold-failed == 'true'
+      shell: bash
+      run: |
+        echo "::error::rightsizing-check reached the fail-on level (see the report above)"
+        exit 1

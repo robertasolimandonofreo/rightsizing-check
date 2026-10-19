@@ -77,6 +77,8 @@ Scan flags:
       --slack <n>                      a request is inflated above n times the recommendation (default 1.5)
       --cpu-headroom <share>           headroom over the observed CPU (default 0.15)
       --mem-headroom <share>           headroom over the observed memory (default 0.20)
+      --json-file <file>               also write the JSON report to this file (one read of the usage
+                                       for both formats, which matters with --prometheus)
       --cpu-price <n>                  price of a vCPU per month, to show a cost line
       --mem-price <n>                  price of a GiB per month, to show a cost line
   -v, --verbose                        print every finding
@@ -130,6 +132,7 @@ func scan(args []string, env Env) int {
 		promURL, window, selector, tokenEnv, promTimeout          string
 		kubeconfig, kubeContext                                   string
 		useCluster                                                bool
+		jsonFile                                                  string
 		verbose, allowLong                                        bool
 		cfg                                                       = rightsize.DefaultConfig()
 		cpuPrice, memPrice                                        float64
@@ -145,6 +148,7 @@ func scan(args []string, env Env) int {
 	fs.StringVar(&csvFile, "csv", "", "")
 	fs.StringVar(&namespace, "namespace", "default", "")
 	fs.StringVar(&namespace, "n", "default", "")
+	fs.StringVar(&jsonFile, "json-file", "", "")
 	fs.BoolVar(&useCluster, "cluster", false, "")
 	fs.StringVar(&kubeconfig, "kubeconfig", "", "")
 	fs.StringVar(&kubeContext, "context", "", "")
@@ -299,6 +303,19 @@ func scan(args []string, env Env) int {
 
 	ro := report.Options{Verbose: verbose, Version: env.Version, Unmatched: matches.Unmatched,
 		CPUPrice: cpuPrice, MemPrice: memPrice, Config: cfg}
+	if jsonFile != "" {
+		f, err := os.Create(jsonFile)
+		if err != nil {
+			return fail("error: %v", err)
+		}
+		err = report.JSON(f, assessments, ro)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return fail("error: writing %s: %v", jsonFile, err)
+		}
+	}
 	var werr error
 	switch format {
 	case "json":
