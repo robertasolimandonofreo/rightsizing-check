@@ -1,0 +1,79 @@
+# A small, made-up namespace: an inflated API, a well-sized web, a worker that is
+# starved, a database with no requests, and a daemon set.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: api, namespace: shop}
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+        - name: app
+          image: registry.example.com/shop/api:2.3
+          resources:
+            requests: {cpu: 1000m, memory: 2Gi}
+            limits: {memory: 3Gi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: web, namespace: shop}
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: web
+          image: registry.example.com/shop/web:5.1
+          resources:
+            requests: {cpu: 150m, memory: 200Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: worker, namespace: shop}
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: worker
+          image: registry.example.com/shop/worker:1.9
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 640Mi}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: db, namespace: shop}
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: db
+          image: registry.example.com/platform/db:16
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata: {name: agent, namespace: kube-system}
+spec:
+  template:
+    spec:
+      containers:
+        - name: agent
+          image: registry.example.com/platform/agent:4.1
+          resources:
+            requests: {cpu: 500m, memory: 512Mi}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata: {name: report, namespace: shop}
+spec:
+  schedule: "0 3 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: report
+              image: registry.example.com/shop/report:7

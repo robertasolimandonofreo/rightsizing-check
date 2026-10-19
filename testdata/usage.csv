@@ -1,0 +1,11 @@
+namespace,pod,container,cpu_millis,memory_bytes
+shop,api-5d8f7c9b6-x2k4j,app,120,629145600
+shop,api-5d8f7c9b6-q9w8z,app,95,603979776
+shop,api-5d8f7c9b6-v7t6n,app,110,620756992
+shop,web-6c9d8f7b5-h4g5f,web,120,150994944
+shop,web-6c9d8f7b5-d2c5b,web,100,146800640
+shop,worker-7b8c9d6f4-m5n6p,worker,320,603979776
+shop,worker-7b8c9d6f4-r7s8t,worker,280,587202560
+shop,db-0,db,450,1610612736
+kube-system,agent-x2k4j,agent,40,125829120
+kube-system,agent-h4g5f,agent,35,118489088
