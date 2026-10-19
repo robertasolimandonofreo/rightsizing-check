@@ -12,11 +12,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/robertasolimandonofreo/rightsizing-check/internal/cluster"
 	"github.com/robertasolimandonofreo/rightsizing-check/internal/inventory"
 	"github.com/robertasolimandonofreo/rightsizing-check/internal/prom"
 	"github.com/robertasolimandonofreo/rightsizing-check/internal/report"
 	"github.com/robertasolimandonofreo/rightsizing-check/internal/rightsize"
 	"github.com/robertasolimandonofreo/rightsizing-check/internal/usage"
+	"k8s.io/client-go/dynamic"
 )
 
 // Exit codes: 0 success, 1 the --fail-on threshold was reached, 2 a usage or runtime error.
@@ -32,6 +34,8 @@ type Env struct {
 	Stdout  io.Writer
 	Stderr  io.Writer
 	Version string
+	// Cluster replaces the client of the live-cluster mode. Tests use it.
+	Cluster dynamic.Interface
 	// HTTPClient replaces the one used for Prometheus. Tests use it; nil means the default.
 	HTTPClient *http.Client
 }
@@ -41,8 +45,18 @@ It reads manifests and usage files. It never connects to a cluster.
 
 Usage:
   rightsizing-check scan [flags] [paths...]   compare the manifests with the usage files
+  rightsizing-check scan --cluster [flags]    read the workloads and the usage from a live cluster
   rightsizing-check explain <rule>            describe a rule, for example RC001
   rightsizing-check version
+
+Live cluster (read-only: it only lists, with paging and a low request rate):
+      --cluster                read the workloads, HPAs, KEDA ScaledObjects, VPAs and Argo Rollouts
+                               from the cluster, and the usage from metrics-server (an instant, like
+                               kubectl top) unless another usage source is given
+      --kubeconfig <file>      kubeconfig to use (default: the usual one)
+      --context <name>         kubeconfig context to use (default: the current one)
+  -n, --namespace <name>       with --cluster, read only this namespace; otherwise it is the namespace
+                               of kubectl top output without -A (default "default")
 
 Usage data (at least one source):
       --prometheus <url>       read it from Prometheus: GET /api/v1/query, nothing else
@@ -114,6 +128,8 @@ func scan(args []string, env Env) int {
 	var (
 		format, failOn, promCPU, promMem, top, csvFile, namespace string
 		promURL, window, selector, tokenEnv, promTimeout          string
+		kubeconfig, kubeContext                                   string
+		useCluster                                                bool
 		verbose, allowLong                                        bool
 		cfg                                                       = rightsize.DefaultConfig()
 		cpuPrice, memPrice                                        float64
@@ -129,6 +145,9 @@ func scan(args []string, env Env) int {
 	fs.StringVar(&csvFile, "csv", "", "")
 	fs.StringVar(&namespace, "namespace", "default", "")
 	fs.StringVar(&namespace, "n", "default", "")
+	fs.BoolVar(&useCluster, "cluster", false, "")
+	fs.StringVar(&kubeconfig, "kubeconfig", "", "")
+	fs.StringVar(&kubeContext, "context", "", "")
 	fs.StringVar(&promURL, "prometheus", "", "")
 	fs.StringVar(&window, "window", "7d", "")
 	fs.StringVar(&selector, "prom-selector", "", "")
@@ -150,10 +169,11 @@ func scan(args []string, env Env) int {
 		fmt.Fprintf(env.Stderr, format+"\n", a...)
 		return exitUsage
 	}
-	if len(paths) == 0 {
-		return fail("scan needs at least one path (a file, a directory, or - for stdin)")
+	if len(paths) == 0 && !useCluster {
+		return fail("scan needs at least one path (a file, a directory, or - for stdin), or --cluster")
 	}
-	if promURL == "" && promCPU == "" && promMem == "" && top == "" && csvFile == "" {
+	usageGiven := promURL != "" || promCPU != "" || promMem != "" || top != "" || csvFile != ""
+	if !usageGiven && !useCluster {
 		return fail("scan needs usage data: pass --prometheus, --prom-cpu, --prom-mem, --top or --csv (see the README)")
 	}
 	switch format {
@@ -170,6 +190,7 @@ func scan(args []string, env Env) int {
 		return fail("--slack must be at least 1, and headrooms and prices cannot be negative")
 	}
 
+	var clusterSamples []usage.Sample
 	inv, err := inventory.Paths(paths, env.Stdin)
 	if err != nil {
 		return fail("error: %v", err)
@@ -188,11 +209,32 @@ func scan(args []string, env Env) int {
 		}
 		fmt.Fprintln(env.Stderr)
 	}
+	if useCluster {
+		fmt.Fprintln(env.Stderr, "reading the cluster (read-only: list calls only)...")
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		res, err := cluster.Read(ctx, inv, cluster.Options{Kubeconfig: kubeconfig, Context: kubeContext, Namespace: clusterNamespace(namespace, fs),
+			SkipMetrics: usageGiven, Client: env.Cluster, Notes: env.Stderr})
+		stop()
+		if err != nil {
+			return fail("error: %v", err)
+		}
+		fmt.Fprintf(env.Stderr, "read cluster %s: %d Deployments, %d StatefulSets, %d DaemonSets, %d Rollouts, %d HPAs, %d ScaledObjects, %d VPAs, usage of %d containers\n",
+			res.Context, res.Counts["deployments"], res.Counts["statefulsets"], res.Counts["daemonsets"], res.Counts["rollouts"],
+			res.Counts["horizontalpodautoscalers"], res.Counts["scaledobjects"], res.Counts["verticalpodautoscalers"], len(res.Samples))
+		clusterSamples = res.Samples
+	}
+	inv.Sort()
 	if len(inv.Workloads) == 0 {
 		// Not an error, but a typo in the path would otherwise pass a CI check silently.
-		fmt.Fprintf(env.Stderr, "warning: no workloads found in %s (Deployments, StatefulSets, DaemonSets, Jobs, CronJobs and Pods are read)\n", strings.Join(paths, ", "))
+		where := "the cluster"
+		if len(paths) > 0 {
+			where = strings.Join(paths, ", ")
+		}
+		fmt.Fprintf(env.Stderr, "warning: no workloads found in %s (Deployments, StatefulSets, DaemonSets, Rollouts, Jobs, CronJobs and Pods are read)\n", where)
 	}
+
 	var data usage.Dataset
+	data.Merge(clusterSamples)
 	load := func(path string, parse func(io.Reader) ([]usage.Sample, error)) error {
 		if path == "" {
 			return nil
@@ -317,4 +359,19 @@ func explain(args []string, env Env) int {
 		fmt.Fprintf(env.Stdout, "\nExample\n%s\n", strings.Join(lines, "\n"))
 	}
 	return exitOK
+}
+
+// clusterNamespace is the namespace to read in cluster mode: -n only counts when it was given, so
+// its default for kubectl top output ("default") does not limit the read.
+func clusterNamespace(namespace string, fs *flag.FlagSet) string {
+	given := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "n" || f.Name == "namespace" {
+			given = true
+		}
+	})
+	if given {
+		return namespace
+	}
+	return ""
 }

@@ -136,6 +136,18 @@ type Unreadable struct {
 	Reason string
 }
 
+// New returns an empty inventory.
+func New() *Inventory { return &Inventory{Skipped: map[string]int{}} }
+
+// AddJSON adds one object that is already JSON (an object listed from a cluster). file is only
+// used to say where it came from.
+func (inv *Inventory) AddJSON(file string, raw []byte) error { return inv.addObject(file, raw) }
+
+// Sort orders the workloads by ID, so the output does not depend on where each one came from.
+func (inv *Inventory) Sort() {
+	sort.SliceStable(inv.Workloads, func(i, j int) bool { return inv.Workloads[i].ID() < inv.Workloads[j].ID() })
+}
+
 // Paths loads every .yaml, .yml and .json file under the given paths. "-" reads stdin.
 func Paths(paths []string, stdin io.Reader) (*Inventory, error) {
 	inv := &Inventory{Skipped: map[string]int{}}

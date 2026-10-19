@@ -9,6 +9,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/dynamic"
+
+	"github.com/robertasolimandonofreo/rightsizing-check/internal/cluster/clustertest"
 )
 
 func run(t *testing.T, stdin string, args ...string) (int, string, string) {
@@ -351,5 +356,99 @@ spec:
 	_, table, _ := run(t, "", "scan", m, "--csv", u)
 	if !strings.Contains(table, "whose requests a VPA sets (RC010)") {
 		t.Errorf("the summary should explain it:\n%s", table)
+	}
+}
+
+func clusterObjects() []runtime.Object {
+	dep := clustertest.Object("apps/v1", "Deployment", "shop", "api", map[string]any{"spec": map[string]any{
+		"replicas": int64(2),
+		"template": map[string]any{"spec": map[string]any{"containers": []any{
+			map[string]any{"name": "app", "image": "a:1", "resources": map[string]any{"requests": map[string]any{"cpu": "500m", "memory": "1Gi"}}},
+		}}},
+	}})
+	metrics := clustertest.Object("metrics.k8s.io/v1beta1", "PodMetrics", "shop", "api-5d8f7c9b6-x2k4j", map[string]any{"containers": []any{
+		map[string]any{"name": "app", "usage": map[string]any{"cpu": "40m", "memory": "100Mi"}},
+	}})
+	return []runtime.Object{dep, metrics}
+}
+
+func runCluster(t *testing.T, client dynamic.Interface, args ...string) (int, string, string) {
+	t.Helper()
+	var out, errb bytes.Buffer
+	code := Run(args, Env{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errb, Version: "test", Cluster: client})
+	return code, out.String(), errb.String()
+}
+
+func TestScanCluster(t *testing.T) {
+	client := clustertest.New(clusterObjects()...)
+	code, out, errOut := runCluster(t, client, "scan", "--cluster")
+	if code != exitOK {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	if !strings.Contains(out, "shop/deployment/api") || !strings.Contains(out, "oversized") || !strings.Contains(out, "RC008") && !strings.Contains(out, "RC001") {
+		t.Errorf("output:\n%s", out)
+	}
+	if !strings.Contains(errOut, "read-only") || !strings.Contains(errOut, "1 Deployments") || !strings.Contains(errOut, "usage of 1 containers") {
+		t.Errorf("stderr = %q", errOut)
+	}
+	for _, a := range client.Actions() {
+		if a.GetVerb() != "list" {
+			t.Errorf("verb %q: --cluster must only list", a.GetVerb())
+		}
+	}
+	// The usage of the metrics API is an instant, and the tool says so.
+	_, out, _ = runCluster(t, clustertest.New(clusterObjects()...), "scan", "--cluster", "-v")
+	if !strings.Contains(out, "RC008") {
+		t.Errorf("metrics-server usage is a snapshot (RC008):\n%s", out)
+	}
+}
+
+func TestScanClusterWithAnotherUsageSourceSkipsTheMetricsAPI(t *testing.T) {
+	client := clustertest.New(clusterObjects()...)
+	csv := filepath.Join(t.TempDir(), "u.csv")
+	os.WriteFile(csv, []byte("namespace,pod,container,cpu_millis,memory_bytes\nshop,api-5d8f7c9b6-x2k4j,app,40,100000000\n"), 0o600)
+	code, out, _ := runCluster(t, client, "scan", "--cluster", "--csv", csv, "-v")
+	if code != exitOK || strings.Contains(out, "RC008") {
+		t.Errorf("a CSV is a window, not a snapshot (exit %d):\n%s", code, out)
+	}
+	for _, a := range client.Actions() {
+		if a.GetResource().Group == "metrics.k8s.io" {
+			t.Error("the metrics API must not be read when the usage is given")
+		}
+	}
+}
+
+func TestScanClusterNamespaceFlag(t *testing.T) {
+	// Without -n the whole cluster is read, even though -n defaults to "default" for kubectl top.
+	_, out, _ := runCluster(t, clustertest.New(clusterObjects()...), "scan", "--cluster")
+	if !strings.Contains(out, "shop/deployment/api") {
+		t.Errorf("no -n: every namespace is read:\n%s", out)
+	}
+	_, out, _ = runCluster(t, clustertest.New(clusterObjects()...), "scan", "--cluster", "-n", "other")
+	if strings.Contains(out, "shop/deployment/api") {
+		t.Errorf("-n other must not read shop:\n%s", out)
+	}
+	_, out, _ = runCluster(t, clustertest.New(clusterObjects()...), "scan", "--cluster", "--namespace", "shop")
+	if !strings.Contains(out, "shop/deployment/api") {
+		t.Errorf("--namespace shop must read shop:\n%s", out)
+	}
+}
+
+func TestScanNeedsPathsOrCluster(t *testing.T) {
+	if code, _, errOut := run(t, "", "scan"); code != exitUsage || !strings.Contains(errOut, "--cluster") {
+		t.Errorf("exit %d, %q", code, errOut)
+	}
+}
+
+func TestNoWorkloadsWarningComesAfterTheClusterRead(t *testing.T) {
+	// The cluster has workloads: no warning, even though no path was given.
+	_, _, errOut := runCluster(t, clustertest.New(clusterObjects()...), "scan", "--cluster")
+	if strings.Contains(errOut, "no workloads found") {
+		t.Errorf("the cluster has workloads, but got: %q", errOut)
+	}
+	// An empty cluster does warn, and says where it looked.
+	_, _, errOut = runCluster(t, clustertest.New(), "scan", "--cluster")
+	if !strings.Contains(errOut, "no workloads found in the cluster") {
+		t.Errorf("an empty cluster should warn: %q", errOut)
 	}
 }
