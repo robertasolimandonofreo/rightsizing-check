@@ -452,3 +452,51 @@ func TestNoWorkloadsWarningComesAfterTheClusterRead(t *testing.T) {
 		t.Errorf("an empty cluster should warn: %q", errOut)
 	}
 }
+
+func TestJSONFileSitsNextToTheChosenFormat(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "report.json")
+	code, md, _ := run(t, "", "scan", sample, "--csv", csv, "-f", "markdown", "--json-file", out)
+	if code != exitOK || !strings.HasPrefix(md, "<!-- rightsizing-check -->") {
+		t.Fatalf("exit %d, stdout %.60q", code, md)
+	}
+	raw, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		SchemaVersion int `json:"schemaVersion"`
+		Summary       struct {
+			Total int `json:"total"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil || doc.SchemaVersion != 1 || doc.Summary.Total != 6 {
+		t.Errorf("json file: %v %+v", err, doc)
+	}
+	if code, _, _ := run(t, "", "scan", sample, "--csv", csv, "--json-file", filepath.Join(t.TempDir(), "no", "such", "dir", "r.json")); code != exitUsage {
+		t.Errorf("an unwritable file must be an error, exit %d", code)
+	}
+}
+
+func TestJSONFileReadsPrometheusOnce(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		series := func(v string) string {
+			return `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"namespace":"shop","pod":"api-5d8f7c9b6-x2k4j","container":"app"},"value":[1,"` + v + `"]}]}}`
+		}
+		if strings.Contains(r.URL.Query().Get("query"), "container_cpu_usage_seconds_total") {
+			_, _ = w.Write([]byte(series("0.04")))
+			return
+		}
+		_, _ = w.Write([]byte(series("104857600")))
+	}))
+	t.Cleanup(srv.Close)
+	m := filepath.Join(t.TempDir(), "m.yaml")
+	os.WriteFile(m, []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: api, namespace: shop}\nspec:\n  replicas: 1\n  template:\n    spec:\n      containers:\n        - {name: app, image: a:1, resources: {requests: {cpu: 500m}}}\n"), 0o600)
+	if code, _, _ := run(t, "", "scan", m, "--prometheus", srv.URL, "-f", "markdown", "--json-file", filepath.Join(t.TempDir(), "r.json")); code != exitOK {
+		t.Fatalf("exit %d", code)
+	}
+	if hits != 2 {
+		t.Errorf("both formats come from one read: %d requests, want 2 (one CPU, one memory)", hits)
+	}
+}
