@@ -150,8 +150,27 @@ utilization under about 58%. The headrooms are `--cpu-headroom` and `--mem-headr
 | RC006 | data  | No request is set                                                    |
 | RC007 | data  | No usage found for the container                                     |
 | RC008 | data  | Usage is a `kubectl top` snapshot, not a window                      |
+| RC009 | caveat | An HPA or KEDA scaler on CPU or memory utilization would scale out if the request came down to the recommendation |
 
 `rightsizing-check explain RC001` documents any rule, with a problem and a fix.
+
+## HPAs and KEDA
+
+A HorizontalPodAutoscaler that scales on **utilization** compares the usage with the request, so
+lowering the request raises the utilization it sees. When the scanned files include the HPA (or a
+KEDA `ScaledObject` with a `cpu` or `memory` trigger), the tool computes what the scaler would see at
+the recommended request and compares it with the target. RC009 fires only when it would pass the
+target, with the numbers:
+
+```
+RC009 [caveat] ScaledObject api scales on cpu utilization (target 75%): it sees 8% of the request
+today and would see 76% at the recommended request, so it would scale out, up to 6 replicas
+```
+
+Scalers that do not depend on the request are ignored: `AverageValue` targets, and every other KEDA
+trigger (RabbitMQ, Prometheus, cron, HTTP). The summary adds how much of the reclaimable CPU sits on
+such workloads. Scan the folder that holds your HPAs and ScaledObjects too, or export them from the
+cluster (`kubectl get hpa -A -o yaml > hpa.yaml`) and pass the file.
 
 ## What the numbers mean
 
@@ -181,9 +200,8 @@ recommendation, reclaimable) and its findings.
 - **A recommendation is a starting point.** It is only as good as the window of your data. A job that
   runs once a month, or a spike you did not capture, will make a request look inflated. Use a
   window that covers your busiest period, and lower requests one workload at a time.
-- **HPA.** A HorizontalPodAutoscaler that scales on CPU utilization uses the request as the
-  denominator. Lowering the request raises the utilization the HPA sees, and it can scale out.
-  The tool does not read HPAs yet: check them before you lower a CPU request.
+- **HPA.** Read from the scanned manifests only (see [HPAs and KEDA](#hpas-and-keda)). An HPA that
+  lives only in the cluster is not seen: export it and pass the file.
 - **Memory is not compressible.** A request is a reservation, but a memory limit below the usage
   kills the container. Prefer the maximum over the window for memory, and do not shrink a container
   flagged RC005 before you know why it is close to its limit.
@@ -196,8 +214,8 @@ recommendation, reclaimable) and its findings.
 
 ## Roadmap
 
-Reading HPAs and VPAs, Argo Rollouts and KEDA, a live-cluster mode (read-only), and a GitHub Action
-with a pull request comment. None of it is started.
+Reading VPAs and Argo Rollouts, a live-cluster mode (read-only), and a GitHub Action with a pull
+request comment. None of it is started.
 
 ## Related
 

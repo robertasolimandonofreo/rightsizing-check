@@ -72,6 +72,11 @@ type Assessment struct {
 	Status     Status             `json:"status"`
 	Containers []Container        `json:"containers"`
 	Findings   []Finding          `json:"findings"`
+	// AutoscaledBy names the HPAs and KEDA ScaledObjects that target the workload.
+	AutoscaledBy []string `json:"autoscaledBy,omitempty"`
+	// ScalesOut is true when lowering the CPU request to the recommendation would push an HPA
+	// above its target (RC009 on CPU).
+	ScalesOut bool `json:"-"`
 }
 
 // ReclaimableCPU is the CPU that the recommendation frees across all replicas, in millicores.
@@ -109,7 +114,7 @@ func ceilTo(v float64, step int64) int64 {
 }
 
 // Evaluate compares one workload with the samples that Match assigned to it.
-func Evaluate(w inventory.Workload, samples map[string][]usage.Sample, cfg Config) Assessment {
+func Evaluate(w inventory.Workload, samples map[string][]usage.Sample, cfg Config, scalers []inventory.Autoscaler) Assessment {
 	a := Assessment{Workload: w, Findings: []Finding{}}
 	add := func(rule string, container, format string, args ...any) {
 		r, _ := Lookup(rule)
@@ -156,6 +161,7 @@ func Evaluate(w inventory.Workload, samples map[string][]usage.Sample, cfg Confi
 	if snapshot {
 		add("RC008", "", "usage comes from kubectl top, one instant: treat the recommendation as a hint")
 	}
+	scalerFindings(&a, scalers, add)
 
 	a.Status = status(a, observed)
 	sortFindings(a.Findings)
@@ -225,7 +231,7 @@ func status(a Assessment, observed int) Status {
 }
 
 func sortFindings(f []Finding) {
-	rank := map[Kind]int{Risk: 0, Waste: 1, Data: 2}
+	rank := map[Kind]int{Risk: 0, Waste: 1, Caveat: 2, Data: 3}
 	sort.SliceStable(f, func(i, j int) bool {
 		if rank[f[i].Kind] != rank[f[j].Kind] {
 			return rank[f[i].Kind] < rank[f[j].Kind]
@@ -255,4 +261,70 @@ func trimZero(v float64) string {
 		s = s[:len(s)-1]
 	}
 	return s
+}
+
+// ScalersFor returns the autoscalers that target the workload, in its namespace.
+func ScalersFor(w inventory.Workload, all []inventory.Autoscaler) []inventory.Autoscaler {
+	var out []inventory.Autoscaler
+	seen := map[string]bool{}
+	for _, s := range all {
+		if s.Namespace != w.Namespace || s.TargetName != w.Name || s.TargetKind != w.Kind {
+			continue
+		}
+		// The same object can be scanned twice (a manifest and a copy exported from the cluster).
+		if key := s.Kind + "/" + s.Name; !seen[key] {
+			seen[key] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// scalerFindings checks what lowering the requests would do to an autoscaler that scales on
+// utilization. The utilization it sees is the usage of the pod over the sum of its requests, so
+// the question is whether that number, at the recommended requests, passes the target.
+func scalerFindings(a *Assessment, scalers []inventory.Autoscaler, add adder) {
+	for _, sc := range scalers {
+		a.AutoscaledBy = append(a.AutoscaledBy, sc.Kind+"/"+sc.Name)
+		for _, m := range sc.Metrics {
+			var usageSum, now, next float64
+			for _, c := range a.Containers {
+				if m.Container != "" && m.Container != c.Name {
+					continue
+				}
+				switch m.Resource {
+				case "cpu":
+					if !c.HasUsageCPU || c.CPURequest == 0 {
+						continue
+					}
+					usageSum += c.CPUUsage
+					now += float64(c.CPURequest)
+					next += float64(c.CPURequest - c.CPUReclaim)
+				case "memory":
+					if !c.HasUsageMem || c.MemRequest == 0 {
+						continue
+					}
+					usageSum += c.MemUsage
+					now += float64(c.MemRequest)
+					next += float64(c.MemRequest - c.MemReclaim)
+				}
+			}
+			if now == 0 || next >= now {
+				continue // no request would be lowered, so the scaler sees the same utilization
+			}
+			after := 100 * usageSum / next
+			if after <= float64(m.Target) {
+				continue
+			}
+			upTo := ""
+			if sc.MaxReplicas > 0 {
+				upTo = fmt.Sprintf(", up to %d replicas", sc.MaxReplicas)
+			}
+			add("RC009", "", "%s %s scales on %s utilization (target %d%%): it sees %.0f%% of the request today and would see %.0f%% at the recommended request, so it would scale out%s",
+				sc.Kind, sc.Name, m.Resource, m.Target, 100*usageSum/now, after, upTo)
+			if m.Resource == "cpu" {
+				a.ScalesOut = true
+			}
+		}
+	}
 }

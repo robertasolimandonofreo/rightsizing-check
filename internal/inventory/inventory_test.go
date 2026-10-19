@@ -152,3 +152,69 @@ spec:
 		t.Errorf("workloads = %+v", inv.Workloads)
 	}
 }
+
+func TestAutoscalers(t *testing.T) {
+	inv := load(t, `
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: api, namespace: shop}
+spec:
+  scaleTargetRef: {kind: Deployment, name: api}
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 70}}
+    - type: Resource
+      resource: {name: memory, target: {type: AverageValue, averageValue: 500Mi}}
+    - type: ContainerResource
+      containerResource: {name: cpu, container: app, target: {type: Utilization, averageUtilization: 60}}
+---
+apiVersion: autoscaling/v1
+kind: HorizontalPodAutoscaler
+metadata: {name: legacy, namespace: shop}
+spec:
+  scaleTargetRef: {kind: Deployment, name: legacy}
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: {name: worker, namespace: shop}
+spec:
+  scaleTargetRef: {name: worker}
+  maxReplicaCount: 20
+  triggers:
+    - type: cpu
+      metricType: Utilization
+      metadata: {value: "75"}
+    - type: memory
+      metadata: {type: Utilization, value: "65", containerName: app}
+    - type: cpu
+      metricType: AverageValue
+      metadata: {value: "200m"}
+    - type: rabbitmq
+      metadata: {queueName: jobs, value: "10"}
+---
+apiVersion: other.example.com/v1
+kind: ScaledObject
+metadata: {name: not-keda}
+spec: {}
+`)
+	if len(inv.Autoscalers) != 3 {
+		t.Fatalf("autoscalers = %+v", inv.Autoscalers)
+	}
+	hpa, legacy, keda := inv.Autoscalers[0], inv.Autoscalers[1], inv.Autoscalers[2]
+	if hpa.TargetName != "api" || hpa.MaxReplicas != 8 || len(hpa.Metrics) != 2 ||
+		hpa.Metrics[0] != (ScaleMetric{Resource: "cpu", Target: 70}) ||
+		hpa.Metrics[1] != (ScaleMetric{Resource: "cpu", Target: 60, Container: "app"}) {
+		t.Errorf("hpa = %+v (an AverageValue metric must be left out)", hpa)
+	}
+	if len(legacy.Metrics) != 1 || legacy.Metrics[0].Target != 80 {
+		t.Errorf("autoscaling/v1 = %+v", legacy)
+	}
+	if keda.TargetKind != "Deployment" || keda.MaxReplicas != 20 || len(keda.Metrics) != 2 ||
+		keda.Metrics[0] != (ScaleMetric{Resource: "cpu", Target: 75}) ||
+		keda.Metrics[1] != (ScaleMetric{Resource: "memory", Target: 65, Container: "app"}) {
+		t.Errorf("keda = %+v (AverageValue and rabbitmq triggers must be left out)", keda)
+	}
+}

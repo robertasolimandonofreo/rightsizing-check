@@ -8,6 +8,9 @@ const (
 	Waste Kind = "waste"
 	// Risk is a request or limit below what the container uses.
 	Risk Kind = "risk"
+	// Caveat is something to check before acting on a recommendation, without being a problem of
+	// the workload itself.
+	Caveat Kind = "caveat"
 	// Data is about the input: a missing request, or no usage found.
 	Data Kind = "data"
 )
@@ -100,6 +103,18 @@ var Catalog = []Rule{
 		Why:     "kubectl top shows the usage at one instant. A workload that is idle now and busy at night looks oversized, and shrinking it from a snapshot can cause throttling or OOMKills.",
 		Fix:     "Use the Prometheus queries in the README (a 7-day p95 for CPU and a maximum for memory) before changing production.",
 		Example: `kubectl top pods -A --containers   # one instant`,
+	},
+	{
+		ID: "RC009", Kind: Caveat,
+		Title: "An HPA or KEDA scaler uses the request as its denominator",
+		Why:   "A HorizontalPodAutoscaler (or a KEDA cpu or memory trigger) that scales on utilization compares the usage with the request. Lowering the request raises the utilization it sees, so a workload that is oversized today can start to scale out the moment the request comes down.",
+		Fix:   "Either keep the request, or lower it together with the scaler's target so the same usage lands where it does today. Compare the utilization the tool prints with the target before changing anything.",
+		Example: `# usage 38m, request 500m (8% utilization), target 75%
+# recommended request 50m -> 76% utilization: above the target, the HPA scales out
+triggers:
+  - type: cpu
+    metricType: Utilization
+    metadata: {value: "75"}`,
 	},
 }
 

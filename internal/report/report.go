@@ -35,10 +35,13 @@ type Summary struct {
 	RequestedCPUMillis int64                    `json:"requestedCPUMillis"`
 	RequestedMemory    int64                    `json:"requestedMemoryBytes"`
 	ReclaimCPUMillis   int64                    `json:"reclaimableCPUMillis"`
-	ReclaimMemory      int64                    `json:"reclaimableMemoryBytes"`
-	ReclaimCPUPercent  int                      `json:"reclaimableCPUPercent"`
-	ReclaimMemPercent  int                      `json:"reclaimableMemoryPercent"`
-	UnmatchedPods      int                      `json:"unmatchedPods,omitempty"`
+	// ReclaimCPUUnderHPA is the part of the reclaimable CPU on workloads whose HPA would scale
+	// out if the request came down to the recommendation (RC009).
+	ReclaimCPUUnderHPA int64 `json:"reclaimableCPUMillisWithScaleOut"`
+	ReclaimMemory      int64 `json:"reclaimableMemoryBytes"`
+	ReclaimCPUPercent  int   `json:"reclaimableCPUPercent"`
+	ReclaimMemPercent  int   `json:"reclaimableMemoryPercent"`
+	UnmatchedPods      int   `json:"unmatchedPods,omitempty"`
 }
 
 // Summarize computes the counts and the sums. Only workloads with usage data enter the requested
@@ -58,6 +61,9 @@ func Summarize(as []rightsize.Assessment, unmatched int) Summary {
 			s.RequestedMemory += c.MemRequest * int64(a.Workload.Replicas)
 		}
 		s.ReclaimCPUMillis += a.ReclaimableCPU()
+		if a.ScalesOut {
+			s.ReclaimCPUUnderHPA += a.ReclaimableCPU()
+		}
 		s.ReclaimMemory += a.ReclaimableMemory()
 	}
 	if s.RequestedCPUMillis > 0 {
@@ -196,6 +202,9 @@ func summaryText(out io.Writer, s Summary, o Options) error {
 		fmt.Fprintf(out, "Reclaimable requests: %s vCPU (%d%% of the %s requested) and %s GiB (%d%% of %s).\n",
 			cores(s.ReclaimCPUMillis), s.ReclaimCPUPercent, cores(s.RequestedCPUMillis),
 			gib(s.ReclaimMemory), s.ReclaimMemPercent, gib(s.RequestedMemory))
+		if s.ReclaimCPUUnderHPA > 0 {
+			fmt.Fprintf(out, "Of the CPU, %s vCPU is on workloads whose HPA would scale out if the request came down to the recommendation (RC009): lower the target with it, or leave it.\n", cores(s.ReclaimCPUUnderHPA))
+		}
 		if o.CPUPrice > 0 || o.MemPrice > 0 {
 			cost := float64(s.ReclaimCPUMillis)/1000*o.CPUPrice + float64(s.ReclaimMemory)/(1<<30)*o.MemPrice
 			fmt.Fprintf(out, "At your prices that is about %.0f per month in requests. It only becomes savings once the nodes consolidate.\n", cost)
@@ -219,6 +228,8 @@ type jsonWorkload struct {
 	ReclaimMem int64                 `json:"reclaimableMemoryBytes"`
 	Containers []rightsize.Container `json:"containers"`
 	Findings   []rightsize.Finding   `json:"findings"`
+	// AutoscaledBy names the HPAs and ScaledObjects that target the workload.
+	AutoscaledBy []string `json:"autoscaledBy,omitempty"`
 }
 
 // JSON writes a machine-readable report that starts with schemaVersion and toolVersion.
@@ -236,7 +247,7 @@ func JSON(out io.Writer, as []rightsize.Assessment, o Options) error {
 			ID: a.Workload.ID(), Kind: a.Workload.Kind, Namespace: a.Workload.Namespace,
 			Name: a.Workload.Name, File: a.Workload.File, Status: a.Status,
 			ReclaimCPU: a.ReclaimableCPU(), ReclaimMem: a.ReclaimableMemory(),
-			Containers: a.Containers, Findings: a.Findings,
+			Containers: a.Containers, Findings: a.Findings, AutoscaledBy: a.AutoscaledBy,
 		}
 		if a.Workload.LongRunning {
 			r := a.Workload.Replicas

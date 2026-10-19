@@ -178,3 +178,65 @@ func TestEmptyScanWarns(t *testing.T) {
 		t.Errorf("exit=%d stderr=%q", code, errOut)
 	}
 }
+
+func TestHPAWarningEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	manifests := `
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: api, namespace: shop}
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - {name: app, image: a:1, resources: {requests: {cpu: 500m, memory: 512Mi}}}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata: {name: api, namespace: shop}
+spec:
+  scaleTargetRef: {name: api}
+  maxReplicaCount: 6
+  triggers:
+    - {type: cpu, metricType: Utilization, metadata: {value: "75"}}
+`
+	if err := os.WriteFile(filepath.Join(dir, "m.yaml"), []byte(manifests), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	usageCSV := filepath.Join(dir, "u.csv")
+	if err := os.WriteFile(usageCSV, []byte("namespace,pod,container,cpu_millis,memory_bytes\nshop,api-5d8f7c9b6-x2k4j,app,38,100000000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, out, _ := run(t, "", "scan", filepath.Join(dir, "m.yaml"), "--csv", usageCSV, "-f", "json")
+	var doc struct {
+		Summary struct {
+			Reclaim int64 `json:"reclaimableCPUMillis"`
+			Scale   int64 `json:"reclaimableCPUMillisWithScaleOut"`
+		} `json:"summary"`
+		Workloads []struct {
+			AutoscaledBy []string `json:"autoscaledBy"`
+			Findings     []struct {
+				Rule string `json:"rule"`
+			} `json:"findings"`
+		} `json:"workloads"`
+	}
+	if err := json.Unmarshal([]byte(out), &doc); err != nil || len(doc.Workloads) != 1 {
+		t.Fatalf("%v: %s", err, out)
+	}
+	w := doc.Workloads[0]
+	var rules []string
+	for _, f := range w.Findings {
+		rules = append(rules, f.Rule)
+	}
+	if !strings.Contains(strings.Join(rules, ","), "RC009") || len(w.AutoscaledBy) != 1 || w.AutoscaledBy[0] != "ScaledObject/api" {
+		t.Errorf("rules %v, autoscaledBy %v", rules, w.AutoscaledBy)
+	}
+	if doc.Summary.Scale == 0 || doc.Summary.Scale != doc.Summary.Reclaim {
+		t.Errorf("all the reclaimable CPU is under the HPA: %+v", doc.Summary)
+	}
+	_, table, _ := run(t, "", "scan", filepath.Join(dir, "m.yaml"), "--csv", usageCSV)
+	if !strings.Contains(table, "would scale out if the request came down") {
+		t.Errorf("the table summary should explain it:\n%s", table)
+	}
+}

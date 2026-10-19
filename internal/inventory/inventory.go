@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -61,6 +62,30 @@ type Inventory struct {
 	// Kubernetes manifests (a Helm template, for example). They are skipped, not fatal. A file
 	// given on the command line that cannot be parsed is an error instead.
 	Unreadable []Unreadable
+	// Autoscalers are the HorizontalPodAutoscalers and KEDA ScaledObjects found next to the
+	// workloads. One that scales on utilization uses the request as its denominator.
+	Autoscalers []Autoscaler
+}
+
+// Autoscaler is what the request-based rules need from an HPA or a KEDA ScaledObject.
+type Autoscaler struct {
+	Kind       string // HorizontalPodAutoscaler or ScaledObject
+	Name       string
+	Namespace  string
+	TargetKind string
+	TargetName string
+	Metrics    []ScaleMetric
+	// MaxReplicas is zero when the manifest does not say.
+	MaxReplicas int32
+	File        string
+}
+
+// ScaleMetric is a CPU or memory metric that scales on utilization of the request.
+type ScaleMetric struct {
+	Resource string // cpu or memory
+	Target   int    // percent of the request
+	// Container limits the metric to one container (HPA ContainerResource, KEDA containerName).
+	Container string
 }
 
 // Unreadable is a file that was skipped, and why.
@@ -101,12 +126,12 @@ func Paths(paths []string, stdin io.Reader) (*Inventory, error) {
 			}
 			// A file named on the command line must parse. One found in a directory may be
 			// a template or a values file, so it is skipped, and nothing it held is kept.
-			before, skipped := len(inv.Workloads), maps.Clone(inv.Skipped)
+			before, scalers, skipped := len(inv.Workloads), len(inv.Autoscalers), maps.Clone(inv.Skipped)
 			if err := inv.Add(path, data); err != nil {
 				if path == p {
 					return fmt.Errorf("%s: %w", path, err)
 				}
-				inv.Workloads, inv.Skipped = inv.Workloads[:before], skipped
+				inv.Workloads, inv.Autoscalers, inv.Skipped = inv.Workloads[:before], inv.Autoscalers[:scalers], skipped
 				inv.Unreadable = append(inv.Unreadable, Unreadable{Path: path, Reason: firstLine(err)})
 			}
 			return nil
@@ -218,6 +243,117 @@ func (inv *Inventory) addObject(file string, raw json.RawMessage) error {
 			return err
 		}
 		add("Pod", o.ObjectMeta, nil, true, o.Spec)
+	case "HorizontalPodAutoscaler":
+		var o struct {
+			Metadata metav1.ObjectMeta `json:"metadata"`
+			Spec     struct {
+				ScaleTargetRef struct {
+					Kind string `json:"kind"`
+					Name string `json:"name"`
+				} `json:"scaleTargetRef"`
+				MaxReplicas                    int32 `json:"maxReplicas"`
+				TargetCPUUtilizationPercentage *int  `json:"targetCPUUtilizationPercentage"`
+				Metrics                        []struct {
+					Type     string `json:"type"`
+					Resource *struct {
+						Name   string `json:"name"`
+						Target struct {
+							Type               string `json:"type"`
+							AverageUtilization *int   `json:"averageUtilization"`
+						} `json:"target"`
+					} `json:"resource"`
+					ContainerResource *struct {
+						Name      string `json:"name"`
+						Container string `json:"container"`
+						Target    struct {
+							Type               string `json:"type"`
+							AverageUtilization *int   `json:"averageUtilization"`
+						} `json:"target"`
+					} `json:"containerResource"`
+				} `json:"metrics"`
+			} `json:"spec"`
+		}
+		if err := decode(&o); err != nil {
+			return err
+		}
+		a := Autoscaler{Kind: "HorizontalPodAutoscaler", Name: o.Metadata.Name, Namespace: o.Metadata.Namespace,
+			TargetKind: o.Spec.ScaleTargetRef.Kind, TargetName: o.Spec.ScaleTargetRef.Name,
+			MaxReplicas: o.Spec.MaxReplicas, File: file}
+		if a.Namespace == "" {
+			a.Namespace = "default"
+		}
+		// autoscaling/v1 has only a CPU percentage.
+		if v := o.Spec.TargetCPUUtilizationPercentage; v != nil {
+			a.Metrics = append(a.Metrics, ScaleMetric{Resource: "cpu", Target: *v})
+		}
+		for _, m := range o.Spec.Metrics {
+			if r := m.Resource; r != nil && r.Target.Type == "Utilization" && r.Target.AverageUtilization != nil {
+				a.Metrics = append(a.Metrics, ScaleMetric{Resource: r.Name, Target: *r.Target.AverageUtilization})
+			}
+			if r := m.ContainerResource; r != nil && r.Target.Type == "Utilization" && r.Target.AverageUtilization != nil {
+				a.Metrics = append(a.Metrics, ScaleMetric{Resource: r.Name, Target: *r.Target.AverageUtilization, Container: r.Container})
+			}
+		}
+		inv.Autoscalers = append(inv.Autoscalers, a)
+	case "ScaledObject":
+		// Only KEDA's: it creates an HPA, and its cpu and memory triggers work the same way.
+		if !strings.HasPrefix(meta.APIVersion, "keda.sh/") {
+			return nil
+		}
+		var o struct {
+			Metadata metav1.ObjectMeta `json:"metadata"`
+			Spec     struct {
+				ScaleTargetRef struct {
+					Kind string `json:"kind"`
+					Name string `json:"name"`
+				} `json:"scaleTargetRef"`
+				MaxReplicaCount int32 `json:"maxReplicaCount"`
+				Triggers        []struct {
+					Type       string         `json:"type"`
+					MetricType string         `json:"metricType"`
+					Metadata   map[string]any `json:"metadata"`
+				} `json:"triggers"`
+			} `json:"spec"`
+		}
+		if err := decode(&o); err != nil {
+			return err
+		}
+		a := Autoscaler{Kind: "ScaledObject", Name: o.Metadata.Name, Namespace: o.Metadata.Namespace,
+			TargetKind: o.Spec.ScaleTargetRef.Kind, TargetName: o.Spec.ScaleTargetRef.Name,
+			MaxReplicas: o.Spec.MaxReplicaCount, File: file}
+		if a.Namespace == "" {
+			a.Namespace = "default"
+		}
+		if a.TargetKind == "" {
+			a.TargetKind = "Deployment" // KEDA's default
+		}
+		for _, t := range o.Spec.Triggers {
+			if t.Type != "cpu" && t.Type != "memory" {
+				continue
+			}
+			// metricType is the current field; metadata.type is the deprecated one. AverageValue is
+			// an absolute number and does not depend on the request.
+			kind := t.MetricType
+			if kind == "" {
+				kind, _ = t.Metadata["type"].(string)
+			}
+			if kind != "" && kind != "Utilization" {
+				continue
+			}
+			target := 0
+			switch v := t.Metadata["value"].(type) {
+			case string:
+				target, _ = strconv.Atoi(strings.TrimSpace(v))
+			case float64:
+				target = int(v)
+			}
+			if target <= 0 {
+				continue
+			}
+			container, _ := t.Metadata["containerName"].(string)
+			a.Metrics = append(a.Metrics, ScaleMetric{Resource: t.Type, Target: target, Container: container})
+		}
+		inv.Autoscalers = append(inv.Autoscalers, a)
 	case "ReplicaSet", "ReplicationController":
 		// Owned by a Deployment in practice: counted so the report can say what was left out.
 		inv.Skipped[meta.Kind]++
