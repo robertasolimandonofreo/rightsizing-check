@@ -176,3 +176,54 @@ func TestCatalogHasEveryRule(t *testing.T) {
 		}
 	}
 }
+
+// generatedName builds a pod name the way the apiserver does: the base is cut at 58 characters
+// and five random ones are added.
+func generatedName(base, random string) string {
+	if len(base) > 58 {
+		base = base[:58]
+	}
+	return base + random
+}
+
+func TestMatchPodsWithTruncatedNames(t *testing.T) {
+	// 49 characters: "<name>-<10-character hash>-" is 61, so the apiserver cuts it at 58 and the
+	// pod name loses the last separator and the end of the hash.
+	long := "reports-aggregation-daily-summary-service-prod-v2"
+	if len(long) != 49 {
+		t.Fatalf("test name has %d characters", len(long))
+	}
+	longer := strings.Repeat("x", 70) // the cut falls inside the name itself
+	ws := []inventory.Workload{
+		{Kind: "Deployment", Namespace: "shop", Name: long},
+		{Kind: "DaemonSet", Namespace: "shop", Name: longer},
+		{Kind: "Deployment", Namespace: "shop", Name: "reports"},
+	}
+	cases := []struct {
+		name string
+		pod  string
+		want int // index of the workload that must claim the pod, -1 for none
+	}{
+		{"10-character hash, cut", generatedName(long+"-5d8f7c9b6c-", "x2k4j"), 0},
+		{"9-character hash, cut", generatedName(long+"-6c9d8f7b5-", "q9w8z"), 0},
+		{"cut inside the DaemonSet name", generatedName(longer+"-", "x2k4j"), 1},
+		{"a vowel is not in the alphabet", generatedName(long+"-5d8f7c9b6c-", "x2k4e"), -1},
+		{"a word is not a generated name", "reports-aggregation-daily-summary-service-prod-v2-extra-words-abcdefgh", -1},
+		{"the short workload still matches", "reports-5d8f7c9b6-x2k4j", 2},
+	}
+	for _, c := range cases {
+		if c.name != "a word is not a generated name" && c.name != "the short workload still matches" && len(c.pod) != 63 {
+			t.Fatalf("%s: pod has %d characters, want 63", c.name, len(c.pod))
+		}
+		m := Match(ws, []usage.Sample{{Namespace: "shop", Pod: c.pod, Container: "c"}})
+		got := -1
+		for idx, byContainer := range m.ByWorkload {
+			if len(byContainer["c"]) == 1 {
+				got = idx
+			}
+		}
+		if got != c.want {
+			t.Errorf("%s: pod %q matched workload %d, want %d", c.name, c.pod, got, c.want)
+		}
+	}
+}

@@ -23,6 +23,27 @@ func isGenerated(s string, min, max int) bool {
 	return true
 }
 
+// maxGeneratedBase is how much of a name the apiserver keeps before it adds the five random
+// characters: a generated name is at most 63 characters.
+const maxGeneratedBase = 58
+
+// truncatedPod recognizes the pod of a workload with a long name. The apiserver cuts the base
+// ("<replicaset>-" for a Deployment, "<name>-" for a DaemonSet) at 58 characters and then adds
+// five random ones, so a generated name that would pass 63 characters loses its last separator
+// and, for a Deployment, part of the ReplicaSet hash. Such a pod name is exactly 63 characters.
+func truncatedPod(name, pod string) bool {
+	if len(pod) != maxGeneratedBase+5 {
+		return false
+	}
+	base := name + "-"
+	if len(base) > maxGeneratedBase {
+		// the cut fell inside the workload name
+		return pod[:maxGeneratedBase] == base[:maxGeneratedBase] && isGenerated(pod[maxGeneratedBase:], 5, 5)
+	}
+	rest, ok := strings.CutPrefix(pod, base)
+	return ok && isGenerated(rest, 6, len(rest))
+}
+
 func isOrdinal(s string) bool {
 	if s == "" {
 		return false
@@ -42,6 +63,9 @@ func isOrdinal(s string) bool {
 func podOf(w inventory.Workload, pod string) bool {
 	if w.Kind == "Pod" {
 		return pod == w.Name
+	}
+	if (w.Kind == "Deployment" || w.Kind == "DaemonSet") && truncatedPod(w.Name, pod) {
+		return true
 	}
 	rest, ok := strings.CutPrefix(pod, w.Name+"-")
 	if !ok {
