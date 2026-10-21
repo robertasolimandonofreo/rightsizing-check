@@ -25,7 +25,13 @@ you do have a Prometheus, `--prometheus` fetches the two queries for you.
 
 ## Install
 
-Download a binary for Linux, macOS or Windows (amd64 and arm64) from the
+With Homebrew (macOS and Linux):
+
+```bash
+brew install robertasolimandonofreo/tap/rightsizing-check
+```
+
+Or download a binary for Linux, macOS or Windows (amd64 and arm64) from the
 [releases page](https://github.com/robertasolimandonofreo/rightsizing-check/releases), and check it
 against `checksums.txt`:
 
