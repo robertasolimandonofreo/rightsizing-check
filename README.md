@@ -12,7 +12,7 @@ keeps nodes half empty, and Karpenter cannot consolidate pods that say they need
 `rightsizing-check` lists the requests to lower, how much they free, and the workloads that are
 under-requested, which are a risk of their own.
 
-> **Status: early (v0.4.0).** It reads manifests or a live cluster, and four kinds of usage input. It is not a
+> **Status: early (v0.4.1).** It reads manifests or a live cluster, and four kinds of usage input. It is not a
 > recommender that applies changes: it never edits your files. See [Limits](#limits).
 
 ## Why another one
@@ -282,7 +282,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: robertasolimandonofreo/rightsizing-check@v0.4.0
+      - uses: robertasolimandonofreo/rightsizing-check@v0.4.1
         with:
           path: ./k8s
           prometheus: https://prometheus.example.com
