@@ -1,6 +1,6 @@
 module github.com/robertasolimandonofreo/rightsizing-check
 
-go 1.26.9
+go 1.26.10
 
 require (
 	k8s.io/api v0.37.1
