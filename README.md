@@ -362,6 +362,11 @@ go test -race ./...
 go run ./cmd/rightsizing-check scan testdata/sample.yaml --csv testdata/usage.csv
 ```
 
+## More
+
+- Guide and examples: https://www.robertasoliman.com/en/tools/rightsizing-check
+- Article: https://www.robertasoliman.com/en/blog/rightsizing-check-find-inflated-kubernetes-requests
+
 ## License
 
 Apache-2.0.

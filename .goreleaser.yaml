@@ -32,3 +32,16 @@ changelog:
   sort: asc
   filters:
     exclude: ["^docs:", "^chore:", "^test:"]
+
+brews:
+  - name: rightsizing-check
+    repository:
+      owner: robertasolimandonofreo
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: https://www.robertasoliman.com/en/tools/rightsizing-check
+    description: "Find Kubernetes CPU and memory requests far above real usage"
+    license: Apache-2.0
+    test: |
+      system "#{bin}/rightsizing-check", "version"
